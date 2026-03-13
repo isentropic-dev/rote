@@ -29,18 +29,18 @@ pub async fn run(
     dataset: DataSet,
     browser: Browser,
 ) -> io::Result<()> {
+    // Subscribe before installing the recorder so we don't miss
+    // any CDP events emitted during injection.
+    let mut browser_events = browser.subscribe();
+
     install_recorder(&browser)
         .await
         .map_err(|error| io::Error::other(format!("failed to install recorder: {error}")))?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut core = TrainingCore::new(dataset.clone(), event_tx);
-    let mut browser_events = browser.subscribe();
     let mut terminal_events = EventStream::new();
     let mut state = TrainingScreenState::new(&dataset);
-
-    state.sync_from_core(&core);
-    drain_training_events(&mut event_rx, &mut state, &core, &dataset);
 
     loop {
         terminal.draw(|frame| draw(frame, &state, &core, &dataset))?;
@@ -73,10 +73,6 @@ impl TrainingScreenState {
             step_lines: Vec::new(),
             last_status: initial_status(dataset),
         }
-    }
-
-    fn sync_from_core(&mut self, core: &TrainingCore) {
-        self.step_lines = core.steps().iter().map(StepSummary::summary).collect();
     }
 }
 
@@ -145,7 +141,12 @@ fn handle_browser_event(
             );
         }
         Err(broadcast::error::RecvError::Closed) => {
-            "Browser connection closed.".clone_into(&mut state.last_status);
+            // Clippy pedantic wants clone_into here for allocation reuse,
+            // but readability wins on an error path that runs at most once.
+            #[allow(clippy::assigning_clones)]
+            {
+                state.last_status = "Browser connection closed.".to_owned();
+            }
         }
     }
 }
@@ -158,18 +159,17 @@ fn drain_training_events(
 ) {
     while let Ok(event) = event_rx.try_recv() {
         match event {
-            TrainingEvent::StepRecorded { index, step }
-            | TrainingEvent::StepUpdated { index, step } => {
-                update_step_line(&mut state.step_lines, index, StepSummary::summary(&step));
-                state.last_status = status_for_progress(core);
+            TrainingEvent::StepRecorded { index, step } => {
+                let label = step_summary(&step);
+                state.last_status = format!("Step {} recorded: {label}", index + 1);
+                update_step_line(&mut state.step_lines, index, label);
+            }
+            TrainingEvent::StepUpdated { index, step } => {
+                update_step_line(&mut state.step_lines, index, step_summary(&step));
             }
             TrainingEvent::ColumnBound { column, step_index } => {
                 let name = column_name(dataset, column);
-                state.last_status = format!(
-                    "Mapped {name} to step {}. {}",
-                    step_index + 1,
-                    status_for_progress(core)
-                );
+                state.last_status = format!("Mapped {name} to step {}.", step_index + 1);
             }
             TrainingEvent::RowComplete { row_index } => {
                 state.last_status =
@@ -190,9 +190,7 @@ fn drain_training_events(
                     display_cell(&value)
                 );
             }
-            TrainingEvent::SpeedChanged(_) => {
-                state.last_status = status_for_progress(core);
-            }
+            TrainingEvent::SpeedChanged(_) => {}
             TrainingEvent::Error(message) => {
                 state.last_status = message;
             }
@@ -239,7 +237,7 @@ fn draw(frame: &mut Frame, state: &TrainingScreenState, core: &TrainingCore, dat
 
     draw_row_panel(frame, chunks[0], core, dataset);
     draw_steps_panel(frame, chunks[1], state);
-    draw_status_panel(frame, chunks[2], state, core, dataset);
+    draw_status_panel(frame, chunks[2], state, core);
 }
 
 fn draw_row_panel(frame: &mut Frame, area: Rect, core: &TrainingCore, dataset: &DataSet) {
@@ -287,11 +285,10 @@ fn draw_status_panel(
     area: Rect,
     state: &TrainingScreenState,
     core: &TrainingCore,
-    _dataset: &DataSet,
 ) {
-    let summary = status_for_progress(core);
+    let progress = status_for_progress(core);
     let lines = vec![
-        Line::from(summary),
+        Line::from(progress),
         Line::from(state.last_status.as_str()),
         Line::from(vec![
             Span::styled("[Enter]", Style::default().fg(Color::Green)),
@@ -384,31 +381,23 @@ fn column_name(dataset: &DataSet, column: usize) -> String {
         .unwrap_or_else(|| format!("Column {}", column + 1))
 }
 
-fn display_cell(value: &str) -> String {
-    if value.is_empty() {
-        "<empty>".to_owned()
-    } else {
-        value.to_owned()
-    }
+fn display_cell(value: &str) -> &str {
+    if value.is_empty() { "<empty>" } else { value }
 }
 
-struct StepSummary;
-
-impl StepSummary {
-    fn summary(step: &Step) -> String {
-        match step {
-            Step::Click { selector } => {
-                format!("Click {}", describe_selector(selector))
-            }
-            Step::Type { selector, source } => {
-                format!(
-                    "Type {} into {}",
-                    describe_source(source),
-                    describe_selector(selector)
-                )
-            }
-            Step::WaitForNavigation => "Wait for navigation".to_owned(),
+fn step_summary(step: &Step) -> String {
+    match step {
+        Step::Click { selector } => {
+            format!("Click {}", describe_selector(selector))
         }
+        Step::Type { selector, source } => {
+            format!(
+                "Type {} into {}",
+                describe_source(source),
+                describe_selector(selector)
+            )
+        }
+        Step::WaitForNavigation => "Wait for navigation".to_owned(),
     }
 }
 
@@ -471,10 +460,7 @@ mod tests {
             source: ValueSource::Column { index: 0 },
         };
 
-        assert_eq!(
-            StepSummary::summary(&step),
-            "Type column 1 into INPUT (#email)"
-        );
+        assert_eq!(step_summary(&step), "Type column 1 into INPUT (#email)");
     }
 
     #[test]
