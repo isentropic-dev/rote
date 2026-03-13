@@ -307,7 +307,9 @@ fn compute_col_widths(dataset: &DataSet) -> Vec<u16> {
         .map(|i| {
             let label_len = "Column ".len() + i.to_string().len();
             let capped = label_len.min(usize::from(MAX_COL_WIDTH));
-            u16::try_from(capped).unwrap_or(MAX_COL_WIDTH).max(MIN_COL_WIDTH)
+            u16::try_from(capped)
+                .unwrap_or(MAX_COL_WIDTH)
+                .max(MIN_COL_WIDTH)
         })
         .collect();
 

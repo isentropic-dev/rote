@@ -948,8 +948,7 @@ mod tests {
         let workflow = Workflow::new(3, vec![], vec![None, None, None], BTreeMap::new(), None);
         let ds = dataset(&["x", "y"]);
 
-        let (mut engine, _ctrl, _event_rx) =
-            new_instant(workflow, ds, PlaybackSpeed::Auto, 0);
+        let (mut engine, _ctrl, _event_rx) = new_instant(workflow, ds, PlaybackSpeed::Auto, 0);
 
         let result = engine.run_with(OkExecutor).await;
         assert!(matches!(result, Err(PlaybackError::Other(_))));
@@ -999,8 +998,7 @@ mod tests {
         )
         .expect("test dataset");
 
-        let (mut engine, _ctrl, mut event_rx) =
-            new_instant(loaded, ds, PlaybackSpeed::Auto, 0);
+        let (mut engine, _ctrl, mut event_rx) = new_instant(loaded, ds, PlaybackSpeed::Auto, 0);
 
         let result = engine.run_with(OkExecutor).await.unwrap();
         assert_eq!(result.rows_completed, 2);

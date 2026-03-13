@@ -158,8 +158,6 @@ fn windows_candidates() -> Vec<BrowserBinary> {
     ]
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

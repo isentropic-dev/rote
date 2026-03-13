@@ -243,9 +243,7 @@ fn training_command_from_cdp_event(event: &CdpEvent) -> Option<Command> {
         "Runtime.consoleAPICalled" => recorder::parse_recorder_event(&event.params),
         "Page.frameNavigated" => {
             let frame = event.params.get("frame")?;
-            let is_sub_frame = frame
-                .get("parentId")
-                .is_some_and(|v| !v.is_null());
+            let is_sub_frame = frame.get("parentId").is_some_and(|v| !v.is_null());
             if is_sub_frame {
                 return None;
             }

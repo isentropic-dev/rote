@@ -63,8 +63,6 @@ impl BrowserProcess {
         Ok(process)
     }
 
-
-
     /// List open tabs/targets.
     pub async fn tabs(&self) -> Result<Vec<TabInfo>, CdpError> {
         fetch_tabs(self.port).await

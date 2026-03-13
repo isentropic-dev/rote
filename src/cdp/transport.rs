@@ -85,7 +85,12 @@ impl Transport {
         let writer_handle = {
             let pending = Arc::clone(&pending);
             let cdp_log_out = open_cdp_log();
-            tokio::spawn(Self::writer_loop(ws_write, command_rx, pending, cdp_log_out))
+            tokio::spawn(Self::writer_loop(
+                ws_write,
+                command_rx,
+                pending,
+                cdp_log_out,
+            ))
         };
 
         Ok(Self {

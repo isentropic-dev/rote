@@ -16,9 +16,7 @@ use tokio::sync::mpsc;
 use crate::{
     cdp::Browser,
     data::DataSet,
-    playback::{
-        ErrorAction, PlaybackControl, PlaybackEngine, PlaybackEvent,
-    },
+    playback::{ErrorAction, PlaybackControl, PlaybackEngine, PlaybackEvent},
     workflow::{PlaybackSpeed, Step, Workflow},
 };
 
@@ -63,7 +61,13 @@ pub async fn run(
     let mut engine_done = false;
 
     let mut terminal_events = EventStream::new();
-    let mut state = PlaybackScreenState::new(total_rows, total_steps, step_summaries, start_row, PlaybackSpeed::Auto);
+    let mut state = PlaybackScreenState::new(
+        total_rows,
+        total_steps,
+        step_summaries,
+        start_row,
+        PlaybackSpeed::Auto,
+    );
     let mut user_quit = false;
 
     loop {
@@ -281,19 +285,13 @@ fn handle_key_event(
     false
 }
 
-fn handle_playback_event(
-    event: PlaybackEvent,
-    state: &mut PlaybackScreenState,
-) {
+fn handle_playback_event(event: PlaybackEvent, state: &mut PlaybackScreenState) {
     match event {
         PlaybackEvent::RowStarted { row_index } => {
             state.current_row = row_index;
             state.current_step = 0;
             let display_row = row_index + 1;
-            state.status = format!(
-                "Playing row {display_row} of {}...",
-                state.total_rows,
-            );
+            state.status = format!("Playing row {display_row} of {}...", state.total_rows,);
         }
         PlaybackEvent::StepStarted { step_index, .. } => {
             state.current_step = step_index;
@@ -313,7 +311,9 @@ fn handle_playback_event(
         }
         PlaybackEvent::RowCompleted { row_index } => {
             state.rows_completed += 1;
-            state.row_log.push(format!("✓ Row {} completed", row_index + 1));
+            state
+                .row_log
+                .push(format!("✓ Row {} completed", row_index + 1));
         }
         PlaybackEvent::StepFailed {
             row_index,
@@ -326,11 +326,7 @@ fn handle_playback_event(
                 step_index + 1,
             );
             state.row_log.push(msg);
-            state.status = format!(
-                "Error on row {}, step {}.",
-                row_index + 1,
-                step_index + 1,
-            );
+            state.status = format!("Error on row {}, step {}.", row_index + 1, step_index + 1,);
             state.error_prompt = Some(ErrorPrompt {
                 row_index,
                 step_index,
@@ -413,10 +409,7 @@ fn draw(frame: &mut Frame, state: &PlaybackScreenState) {
 
 fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackScreenState) {
     let display_row = state.current_row + 1;
-    let title = format!(
-        " Playback — Row {display_row} of {} ",
-        state.total_rows,
-    );
+    let title = format!(" Playback — Row {display_row} of {} ", state.total_rows,);
 
     let step_line = if state.finished {
         "Playback complete.".to_owned()
@@ -590,10 +583,7 @@ fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackS
         spans
     };
 
-    let lines = vec![
-        Line::from(state.status.as_str()),
-        Line::from(hint),
-    ];
+    let lines = vec![Line::from(state.status.as_str()), Line::from(hint)];
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
