@@ -3,7 +3,13 @@
 // These types are shared between the training recorder and future playback.
 // They serialize to JSON workflow files.
 
+use std::collections::HashMap;
+use std::path::Path;
+use std::{fs, io};
+
 use serde::{Deserialize, Serialize};
+
+use crate::data::DataSourceConfig;
 
 /// How an element is found in the DOM.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,6 +87,153 @@ pub enum PlaybackSpeed {
     Row,
     /// Fully automatic playback.
     Auto,
+}
+
+/// Current workflow format version.
+const FORMAT_VERSION: u32 = 1;
+
+/// A complete workflow: the artifact that bridges sessions.
+///
+/// Contains everything needed to replay a recorded data entry sequence.
+/// Serialized to JSON for storage, sharing, and version control.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Workflow {
+    /// Format version for forward compatibility.
+    pub version: u32,
+    /// Number of data columns this workflow expects.
+    pub column_count: usize,
+    /// The recorded sequence of actions.
+    pub steps: Vec<Step>,
+    /// Column index → step index mapping. `None` means unbound.
+    pub column_bindings: Vec<Option<usize>>,
+    /// Per-column rules for handling empty cells.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub empty_cell_rules: HashMap<usize, EmptyCellRule>,
+    /// How the data was originally loaded (so playback can reload it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_source: Option<DataSourceConfig>,
+}
+
+/// Errors from workflow serialization and validation.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkflowError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("unsupported workflow version: {found} (max supported: {max})")]
+    UnsupportedVersion { found: u32, max: u32 },
+
+    #[error("column binding references step {step_index}, but only {step_count} steps exist")]
+    InvalidBinding {
+        step_index: usize,
+        step_count: usize,
+    },
+
+    #[error("empty cell rule references column {column}, but only {column_count} columns exist")]
+    InvalidEmptyCellRule { column: usize, column_count: usize },
+}
+
+impl Workflow {
+    /// Create a new workflow with the current format version.
+    #[must_use]
+    pub fn new(
+        column_count: usize,
+        steps: Vec<Step>,
+        column_bindings: Vec<Option<usize>>,
+        empty_cell_rules: HashMap<usize, EmptyCellRule>,
+        data_source: Option<DataSourceConfig>,
+    ) -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            column_count,
+            steps,
+            column_bindings,
+            empty_cell_rules,
+            data_source,
+        }
+    }
+
+    /// Serialize to pretty-printed JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn to_json(&self) -> Result<String, WorkflowError> {
+        serde_json::to_string_pretty(self).map_err(WorkflowError::from)
+    }
+
+    /// Deserialize from JSON, then validate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the JSON is invalid, the version is unsupported,
+    /// or the internal references are inconsistent.
+    pub fn from_json(json: &str) -> Result<Self, WorkflowError> {
+        let workflow: Self = serde_json::from_str(json)?;
+        workflow.validate()?;
+        Ok(workflow)
+    }
+
+    /// Save to a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or file writing fails.
+    pub fn save(&self, path: &Path) -> Result<(), WorkflowError> {
+        let json = self.to_json()?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load from a file, then validate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading, parsing, or validation fails.
+    pub fn load(path: &Path) -> Result<Self, WorkflowError> {
+        let json = fs::read_to_string(path)?;
+        Self::from_json(&json)
+    }
+
+    /// Validate internal consistency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the version is unsupported or references are invalid.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version > FORMAT_VERSION {
+            return Err(WorkflowError::UnsupportedVersion {
+                found: self.version,
+                max: FORMAT_VERSION,
+            });
+        }
+
+        for binding in &self.column_bindings {
+            if let Some(step_index) = binding {
+                if *step_index >= self.steps.len() {
+                    return Err(WorkflowError::InvalidBinding {
+                        step_index: *step_index,
+                        step_count: self.steps.len(),
+                    });
+                }
+            }
+        }
+
+        for &column in self.empty_cell_rules.keys() {
+            if column >= self.column_count {
+                return Err(WorkflowError::InvalidEmptyCellRule {
+                    column,
+                    column_count: self.column_count,
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +319,153 @@ mod tests {
         assert_eq!(json, r#""auto""#);
         let back: PlaybackSpeed = serde_json::from_str(&json).unwrap();
         assert_eq!(back, speed);
+    }
+
+    fn sample_workflow() -> Workflow {
+        let mut rules = HashMap::new();
+        rules.insert(1, EmptyCellRule::Skip);
+
+        Workflow::new(
+            3,
+            vec![
+                Step::Navigate {
+                    url: "https://example.com/form".to_owned(),
+                },
+                Step::Click {
+                    selector: Selector {
+                        strategies: vec![Resolution::Id {
+                            id: "name-field".to_owned(),
+                        }],
+                        tag: "INPUT".to_owned(),
+                    },
+                },
+                Step::Type {
+                    selector: Selector {
+                        strategies: vec![
+                            Resolution::Id {
+                                id: "name-field".to_owned(),
+                            },
+                            Resolution::Css {
+                                selector: "#name-field".to_owned(),
+                            },
+                        ],
+                        tag: "INPUT".to_owned(),
+                    },
+                    source: ValueSource::Column { index: 0 },
+                },
+                Step::Type {
+                    selector: Selector {
+                        strategies: vec![Resolution::Css {
+                            selector: "#age-field".to_owned(),
+                        }],
+                        tag: "INPUT".to_owned(),
+                    },
+                    source: ValueSource::Column { index: 1 },
+                },
+                Step::Click {
+                    selector: Selector {
+                        strategies: vec![Resolution::TextContent {
+                            text: "Submit".to_owned(),
+                        }],
+                        tag: "BUTTON".to_owned(),
+                    },
+                },
+            ],
+            vec![Some(2), Some(3), None],
+            rules,
+            Some(DataSourceConfig::file("data.tsv", crate::data::Delimiter::Tab, true)),
+        )
+    }
+
+    #[test]
+    fn workflow_round_trip() {
+        let workflow = sample_workflow();
+        let json = workflow.to_json().unwrap();
+        let back = Workflow::from_json(&json).unwrap();
+        assert_eq!(back, workflow);
+    }
+
+    #[test]
+    fn workflow_has_version() {
+        let workflow = sample_workflow();
+        let json = workflow.to_json().unwrap();
+        assert!(json.contains(r#""version": 1"#));
+    }
+
+    #[test]
+    fn workflow_omits_empty_optional_fields() {
+        let workflow = Workflow::new(1, vec![], vec![None], HashMap::new(), None);
+        let json = workflow.to_json().unwrap();
+        assert!(!json.contains("emptyCellRules"));
+        assert!(!json.contains("dataSource"));
+    }
+
+    #[test]
+    fn workflow_unsupported_version() {
+        let mut workflow = sample_workflow();
+        workflow.version = 999;
+        let json = serde_json::to_string(&workflow).unwrap();
+        let err = Workflow::from_json(&json).unwrap_err();
+        assert!(err.to_string().contains("unsupported workflow version"));
+    }
+
+    #[test]
+    fn workflow_invalid_binding() {
+        let workflow = Workflow {
+            version: 1,
+            column_count: 1,
+            steps: vec![],
+            column_bindings: vec![Some(5)],
+            empty_cell_rules: HashMap::new(),
+            data_source: None,
+        };
+        let json = serde_json::to_string(&workflow).unwrap();
+        let err = Workflow::from_json(&json).unwrap_err();
+        assert!(err.to_string().contains("column binding references step 5"));
+    }
+
+    #[test]
+    fn workflow_invalid_empty_cell_rule() {
+        let mut rules = HashMap::new();
+        rules.insert(10, EmptyCellRule::Clear);
+        let workflow = Workflow {
+            version: 1,
+            column_count: 2,
+            steps: vec![],
+            column_bindings: vec![],
+            empty_cell_rules: rules,
+            data_source: None,
+        };
+        let json = serde_json::to_string(&workflow).unwrap();
+        let err = Workflow::from_json(&json).unwrap_err();
+        assert!(err.to_string().contains("empty cell rule references column 10"));
+    }
+
+    #[test]
+    fn workflow_file_round_trip() {
+        let workflow = sample_workflow();
+        let dir = std::env::temp_dir().join("rote-test-workflow");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.json");
+
+        workflow.save(&path).unwrap();
+        let loaded = Workflow::load(&path).unwrap();
+        assert_eq!(loaded, workflow);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workflow_json_is_human_readable() {
+        let workflow = sample_workflow();
+        let json = workflow.to_json().unwrap();
+        // Pretty-printed: should have newlines and indentation.
+        assert!(json.contains('\n'));
+        assert!(json.contains("  "));
+        // Key fields should be camelCase.
+        assert!(json.contains("columnCount"));
+        assert!(json.contains("columnBindings"));
+        assert!(json.contains("emptyCellRules"));
+        assert!(json.contains("dataSource"));
     }
 }
