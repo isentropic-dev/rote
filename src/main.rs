@@ -17,7 +17,19 @@ fn main() {
     let args = Args::parse();
 
     // Load data raw (has_headers=false) — the TUI will ask the user.
-    let maybe_dataset = if args.clipboard {
+    let maybe_dataset = if args.demo_data {
+        let demo_tsv = "first_name\tlast_name\temail\tcompany\n\
+                         Alice\tSmith\talice@example.com\tAcme Corp\n\
+                         Bob\tJones\tbob@example.com\tWidgets Inc\n\
+                         Carol\tDavis\tcarol@example.com\tTech Co\n";
+        match data::from_delimited_str(demo_tsv, Delimiter::Tab, false) {
+            Ok(ds) => Some(ds),
+            Err(e) => {
+                eprintln!("Failed to create demo data: {e}");
+                None
+            }
+        }
+    } else if args.clipboard {
         match data::from_clipboard(false) {
             Ok(ds) => Some(ds),
             Err(e) => {

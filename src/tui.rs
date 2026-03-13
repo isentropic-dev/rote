@@ -1,5 +1,6 @@
 mod connect;
 mod data;
+mod playback;
 mod training;
 
 use std::io;
@@ -60,6 +61,11 @@ async fn run_screens(
         connect::Outcome::Quit => return Ok(Outcome::Quit),
     };
 
-    training::run(terminal, dataset, browser).await?;
+    match training::run(terminal, dataset.clone(), browser).await? {
+        training::TrainingOutcome::Quit => return Ok(Outcome::Quit),
+        training::TrainingOutcome::ReadyForPlayback { workflow, browser } => {
+            let _outcome = playback::run(terminal, *workflow, dataset, &browser, 1).await?;
+        }
+    }
     Ok(Outcome::Quit)
 }

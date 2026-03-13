@@ -7,6 +7,10 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(version)]
 pub struct Args {
+    /// Load demo data for development (matches examples/demo-form/).
+    #[arg(long)]
+    pub demo_data: bool,
+
     /// Read data from the system clipboard.
     #[arg(long)]
     pub clipboard: bool,

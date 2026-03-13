@@ -16,8 +16,19 @@ use crate::{
     cdp::{Browser, Event as CdpEvent},
     data::DataSet,
     training::{Command, TrainingCore, TrainingEvent, recorder},
-    workflow::{Resolution, Step, ValueSource},
+    workflow::{Resolution, Step, ValueSource, Workflow},
 };
+
+/// Result of the training screen.
+pub enum TrainingOutcome {
+    /// User quit without completing training.
+    Quit,
+    /// Training complete; ready to play back the remaining rows.
+    ReadyForPlayback {
+        workflow: Box<Workflow>,
+        browser: Browser,
+    },
+}
 
 /// Run the training screen.
 ///
@@ -28,7 +39,7 @@ pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     dataset: DataSet,
     browser: Browser,
-) -> io::Result<()> {
+) -> io::Result<TrainingOutcome> {
     // Subscribe before installing the recorder so we don't miss
     // any CDP events emitted during injection.
     let mut browser_events = browser.subscribe();
@@ -48,11 +59,16 @@ pub async fn run(
         tokio::select! {
             maybe_terminal_event = terminal_events.next() => {
                 let Some(event_result) = maybe_terminal_event else {
-                    return Ok(());
+                    return Ok(TrainingOutcome::Quit);
                 };
 
-                if handle_terminal_event(&event_result?, &mut core, &mut event_rx, &mut state, &dataset) {
-                    return Ok(());
+                match handle_terminal_event(&event_result?, &mut core, &mut event_rx, &mut state, &dataset) {
+                    TerminalAction::Continue => {}
+                    TerminalAction::Quit => return Ok(TrainingOutcome::Quit),
+                    TerminalAction::StartPlayback => {
+                        let workflow = Box::new(core.build_workflow(None));
+                        return Ok(TrainingOutcome::ReadyForPlayback { workflow, browser });
+                    }
                 }
             }
             browser_event = browser_events.recv() => {
@@ -96,29 +112,39 @@ async fn install_recorder(browser: &Browser) -> Result<(), crate::cdp::CdpError>
         .map(|_| ())
 }
 
+enum TerminalAction {
+    Continue,
+    Quit,
+    StartPlayback,
+}
+
 fn handle_terminal_event(
     event: &Event,
     core: &mut TrainingCore,
     event_rx: &mut mpsc::UnboundedReceiver<TrainingEvent>,
     state: &mut TrainingScreenState,
     dataset: &DataSet,
-) -> bool {
+) -> TerminalAction {
     let Event::Key(key) = event else {
-        return false;
+        return TerminalAction::Continue;
     };
 
     if key.code == KeyCode::Char('q')
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
     {
-        return true;
+        return TerminalAction::Quit;
     }
 
     if key.code == KeyCode::Enter {
+        // If we're on row 0 and it's complete, transition to playback.
+        if core.current_row_index() == 0 && core.is_row_complete() {
+            return TerminalAction::StartPlayback;
+        }
         core.process(Command::AdvanceRow);
         drain_training_events(event_rx, state, core, dataset);
     }
 
-    false
+    TerminalAction::Continue
 }
 
 fn handle_browser_event(
@@ -172,8 +198,10 @@ fn drain_training_events(
                 state.last_status = format!("Mapped {name} to step {}.", step_index + 1);
             }
             TrainingEvent::RowComplete { row_index } => {
-                state.last_status =
-                    format!("Row {} complete. Press Enter to continue.", row_index + 1);
+                state.last_status = format!(
+                    "Row {} — all columns mapped. Finish your end-of-row actions (submit, navigate back), then press Enter.",
+                    row_index + 1,
+                );
             }
             TrainingEvent::EmptyCellEncountered { column, row_index } => {
                 state.last_status = format!(
@@ -215,7 +243,10 @@ fn training_command_from_cdp_event(event: &CdpEvent) -> Option<Command> {
         "Runtime.consoleAPICalled" => recorder::parse_recorder_event(&event.params),
         "Page.frameNavigated" => {
             let frame = event.params.get("frame")?;
-            if frame.get("parentId").is_some() {
+            let is_sub_frame = frame
+                .get("parentId")
+                .is_some_and(|v| !v.is_null());
+            if is_sub_frame {
                 return None;
             }
             let url = frame.get("url")?.as_str()?.to_owned();
@@ -287,12 +318,17 @@ fn draw_status_panel(
     core: &TrainingCore,
 ) {
     let progress = status_for_progress(core);
+    let enter_hint = if core.current_row_index() == 0 && core.is_row_complete() {
+        " Done — start playback   "
+    } else {
+        " Next row   "
+    };
     let lines = vec![
         Line::from(progress),
         Line::from(state.last_status.as_str()),
         Line::from(vec![
             Span::styled("[Enter]", Style::default().fg(Color::Green)),
-            Span::raw(" Next row   "),
+            Span::raw(enter_hint),
             Span::styled("[q]", Style::default().fg(Color::Red)),
             Span::raw(" Quit"),
         ]),
@@ -310,6 +346,7 @@ fn draw_status_panel(
 
 fn build_row_lines(core: &TrainingCore, dataset: &DataSet) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let is_teaching_row = core.current_row_index() == 0;
     if let Some(row) = core.current_row_data() {
         for (column, value) in row.iter().enumerate() {
             lines.push(Line::from(column_line(
@@ -317,26 +354,39 @@ fn build_row_lines(core: &TrainingCore, dataset: &DataSet) -> Vec<Line<'static>>
                 column,
                 value,
                 core.bound_columns()[column],
+                is_teaching_row,
             )));
         }
     }
     lines
 }
 
-fn column_line(dataset: &DataSet, column: usize, value: &str, bound_step: Option<usize>) -> String {
+fn column_line(
+    dataset: &DataSet,
+    column: usize,
+    value: &str,
+    bound_step: Option<usize>,
+    is_teaching_row: bool,
+) -> String {
     let marker = if value.is_empty() {
         "·"
     } else if bound_step.is_some() {
-        "✓"
+        if is_teaching_row { "✓" } else { "→" }
     } else {
         "○"
     };
 
-    let binding = match (value.is_empty(), bound_step) {
-        (true, Some(step_index)) => format!("optional, mapped to step {}", step_index + 1),
-        (true, None) => "optional".to_owned(),
-        (false, Some(step_index)) => format!("mapped to step {}", step_index + 1),
-        (false, None) => "not yet mapped".to_owned(),
+    let binding = match (value.is_empty(), bound_step, is_teaching_row) {
+        (true, Some(step_index), true) => {
+            format!("optional, mapped to step {}", step_index + 1)
+        }
+        (true, Some(step_index), false) => {
+            format!("optional, → step {} (pending)", step_index + 1)
+        }
+        (true, None, _) => "optional".to_owned(),
+        (false, Some(step_index), true) => format!("mapped to step {}", step_index + 1),
+        (false, Some(step_index), false) => format!("→ step {} (pending)", step_index + 1),
+        (false, None, _) => "not yet mapped".to_owned(),
     };
 
     format!(
@@ -436,14 +486,22 @@ mod tests {
 
     #[test]
     fn column_line_shows_bound_state() {
-        let line = column_line(&dataset(), 0, "Alice", Some(1));
+        let line = column_line(&dataset(), 0, "Alice", Some(1), true);
         assert!(line.contains('✓'));
         assert!(line.contains("mapped to step 2"));
     }
 
     #[test]
+    fn column_line_shows_bound_state_non_teaching_row() {
+        let line = column_line(&dataset(), 0, "Alice", Some(1), false);
+        assert!(line.contains('→'));
+        assert!(line.contains("→ step 2 (pending)"));
+        assert!(!line.contains('✓'));
+    }
+
+    #[test]
     fn column_line_shows_optional_empty_state() {
-        let line = column_line(&dataset(), 1, "", None);
+        let line = column_line(&dataset(), 1, "", None, true);
         assert!(line.contains('·'));
         assert!(line.contains("optional"));
     }

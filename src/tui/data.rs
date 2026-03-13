@@ -300,7 +300,16 @@ fn prompt_lines<'a>(dataset: &DataSet, screen: Screen) -> Vec<Line<'a>> {
 
 fn compute_col_widths(dataset: &DataSet) -> Vec<u16> {
     let col_count = dataset.column_count();
-    let mut widths = vec![MIN_COL_WIDTH; col_count];
+
+    // Start with the width of auto-generated "Column N" labels so they
+    // are never truncated in the initial header-choice screen.
+    let mut widths: Vec<u16> = (1..=col_count)
+        .map(|i| {
+            let label_len = "Column ".len() + i.to_string().len();
+            let capped = label_len.min(usize::from(MAX_COL_WIDTH));
+            u16::try_from(capped).unwrap_or(MAX_COL_WIDTH).max(MIN_COL_WIDTH)
+        })
+        .collect();
 
     for row in dataset.rows().iter().take(MAX_PREVIEW_ROWS) {
         for (i, cell) in row.iter().enumerate().take(col_count) {

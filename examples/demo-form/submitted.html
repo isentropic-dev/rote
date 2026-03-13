@@ -30,13 +30,75 @@
         color: #166534;
         font-weight: 600;
       }
+
+      .submitted-values {
+        margin: 1.5rem 0;
+        padding: 1rem;
+        background: #f0fdf4;
+        border: 1px solid #bbf7d0;
+        border-radius: 10px;
+        font-size: 0.95rem;
+      }
+
+      .submitted-values dt {
+        font-weight: 600;
+        margin-top: 0.5rem;
+      }
+
+      .submitted-values dt:first-child {
+        margin-top: 0;
+      }
+
+      .submitted-values dd {
+        margin-left: 1rem;
+        color: #374151;
+      }
     </style>
   </head>
   <body>
     <main>
       <h1>Submission received</h1>
-      <p>This confirmation page exists so rote can exercise a simple post-submit navigation during manual tests.</p>
-      <p><a href="index.html">Fill out another demo row</a></p>
+      <div id="values" class="submitted-values"></div>
+      <p><a href="index.html">Fill out another row</a></p>
     </main>
+
+    <script>
+      (function () {
+        var params = new URLSearchParams(window.location.search);
+        var row = {};
+        var labels = {
+          firstName: "First name",
+          lastName: "Last name",
+          email: "Email",
+          company: "Company",
+          plan: "Plan",
+          favoriteColor: "Favorite color",
+          notes: "Notes"
+        };
+
+        // Build the row object and display it.
+        var dl = document.createElement("dl");
+        params.forEach(function (value, key) {
+          row[key] = value;
+          var dt = document.createElement("dt");
+          dt.textContent = labels[key] || key;
+          var dd = document.createElement("dd");
+          dd.textContent = value || "(empty)";
+          dl.appendChild(dt);
+          dl.appendChild(dd);
+        });
+        document.getElementById("values").appendChild(dl);
+
+        // Save to localStorage.
+        var stored = [];
+        try {
+          stored = JSON.parse(localStorage.getItem("rote-demo-submissions") || "[]");
+        } catch (e) {
+          stored = [];
+        }
+        stored.push(row);
+        localStorage.setItem("rote-demo-submissions", JSON.stringify(stored));
+      })();
+    </script>
   </body>
 </html>

@@ -162,13 +162,13 @@ async fn execute_wait_for_navigation(
                 Ok(event) => {
                     if event.method == "Page.frameNavigated" {
                         // Main-frame detection: a main-frame navigation has no
-                        // `parentId` on the frame. This is validated at the CDP
-                        // event parsing level; sub-frame navigations are ignored.
+                        // `parentId` on the frame (or sends it as null).
+                        // Sub-frame navigations have a non-null string parentId.
                         let is_main_frame = event
                             .params
                             .get("frame")
                             .and_then(|f| f.get("parentId"))
-                            .is_none();
+                            .is_none_or(serde_json::Value::is_null);
                         if is_main_frame {
                             return Ok(());
                         }

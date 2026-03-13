@@ -32,6 +32,12 @@
         font-size: 1.75rem;
       }
 
+      h2 {
+        font-size: 1.25rem;
+        margin-top: 2rem;
+        margin-bottom: 0.75rem;
+      }
+
       p {
         margin-top: 0;
         color: #52607a;
@@ -96,6 +102,64 @@
         margin-top: 1rem;
         font-size: 0.9rem;
         color: #607089;
+      }
+
+      /* Submissions table */
+      .submissions {
+        margin-top: 2rem;
+        border-top: 1px solid #d9e2f2;
+        padding-top: 1rem;
+      }
+
+      .submissions-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 0.75rem;
+      }
+
+      .submissions-header h2 {
+        margin: 0;
+      }
+
+      .clear-btn {
+        padding: 0.4rem 0.8rem;
+        font-size: 0.85rem;
+        background: #ef4444;
+        border-radius: 8px;
+      }
+
+      .empty-state {
+        color: #9ca3af;
+        font-style: italic;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9rem;
+      }
+
+      th {
+        text-align: left;
+        padding: 0.5rem 0.75rem;
+        border-bottom: 2px solid #d9e2f2;
+        font-weight: 700;
+        color: #374151;
+      }
+
+      td {
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid #e5e7eb;
+      }
+
+      tr:last-child td {
+        border-bottom: none;
+      }
+
+      .row-num {
+        color: #9ca3af;
+        width: 2rem;
       }
 
       @media (max-width: 640px) {
@@ -167,7 +231,99 @@
         </div>
       </form>
 
-      <p class="note">Tip: pair this with tabular data containing first name, last name, email, company, plan, favorite color, and notes.</p>
+      <div class="submissions">
+        <div class="submissions-header">
+          <h2>Submitted rows</h2>
+          <button class="clear-btn" id="clear-btn" type="button">Clear all</button>
+        </div>
+        <div id="submissions-body"></div>
+      </div>
+
+      <p class="note">Tip: pair this with <code>cargo run -- --demo-data</code> for 4-column data (first name, last name, email, company).</p>
     </main>
+
+    <script>
+      (function () {
+        var fields = ["firstName", "lastName", "email", "company", "plan", "favoriteColor", "notes"];
+        var labels = {
+          firstName: "First",
+          lastName: "Last",
+          email: "Email",
+          company: "Company",
+          plan: "Plan",
+          favoriteColor: "Color",
+          notes: "Notes"
+        };
+
+        function getSubmissions() {
+          try {
+            return JSON.parse(localStorage.getItem("rote-demo-submissions") || "[]");
+          } catch (e) {
+            return [];
+          }
+        }
+
+        function render() {
+          var submissions = getSubmissions();
+          var body = document.getElementById("submissions-body");
+          body.innerHTML = "";
+
+          if (submissions.length === 0) {
+            var p = document.createElement("p");
+            p.className = "empty-state";
+            p.textContent = "No submissions yet. Fill and submit the form to see rows here.";
+            body.appendChild(p);
+            return;
+          }
+
+          // Figure out which columns were actually used.
+          var usedFields = fields.filter(function (f) {
+            return submissions.some(function (row) { return row[f]; });
+          });
+
+          var table = document.createElement("table");
+          var thead = document.createElement("thead");
+          var headerRow = document.createElement("tr");
+
+          var th = document.createElement("th");
+          th.className = "row-num";
+          th.textContent = "#";
+          headerRow.appendChild(th);
+
+          usedFields.forEach(function (f) {
+            var th = document.createElement("th");
+            th.textContent = labels[f] || f;
+            headerRow.appendChild(th);
+          });
+          thead.appendChild(headerRow);
+          table.appendChild(thead);
+
+          var tbody = document.createElement("tbody");
+          submissions.forEach(function (row, i) {
+            var tr = document.createElement("tr");
+            var numTd = document.createElement("td");
+            numTd.className = "row-num";
+            numTd.textContent = (i + 1).toString();
+            tr.appendChild(numTd);
+
+            usedFields.forEach(function (f) {
+              var td = document.createElement("td");
+              td.textContent = row[f] || "";
+              tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+          });
+          table.appendChild(tbody);
+          body.appendChild(table);
+        }
+
+        document.getElementById("clear-btn").addEventListener("click", function () {
+          localStorage.removeItem("rote-demo-submissions");
+          render();
+        });
+
+        render();
+      })();
+    </script>
   </body>
 </html>

@@ -5,11 +5,8 @@ use std::collections::{BTreeMap, HashSet};
 use tokio::sync::mpsc;
 
 use crate::data::DataSet;
-#[cfg(test)]
 use crate::data::DataSourceConfig;
-use crate::workflow::{EmptyCellRule, PlaybackSpeed, Step, ValueSource};
-#[cfg(test)]
-use crate::workflow::Workflow;
+use crate::workflow::{EmptyCellRule, PlaybackSpeed, Step, ValueSource, Workflow};
 
 use super::{Command, SelectorInfo, TrainingEvent};
 
@@ -135,7 +132,6 @@ impl TrainingCore {
     ///
     /// The optional `data_source` is embedded in the workflow so that playback
     /// can reload the data automatically.
-    #[cfg(test)]
     pub fn build_workflow(&self, data_source: Option<DataSourceConfig>) -> Workflow {
         Workflow::new(
             self.data.column_count(),
