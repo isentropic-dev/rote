@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    io::Write,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -18,6 +19,18 @@ use protocol::{Command, Event, Message, RawMessage};
 
 // Trait imports: needed for `.next()` on streams and `.send()` on sinks.
 use futures_util::{SinkExt, StreamExt};
+
+/// Open a CDP log file if `ROTE_CDP_LOG` is set.
+///
+/// Returns `None` if the env var is unset or the file can't be opened.
+fn open_cdp_log() -> Option<std::fs::File> {
+    let path = std::env::var("ROTE_CDP_LOG").ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
 
 /// Pending response senders, keyed by command ID.
 type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, protocol::WireError>>>;
@@ -65,12 +78,14 @@ impl Transport {
         let reader_handle = {
             let event_tx = event_tx.clone();
             let pending = Arc::clone(&pending);
-            tokio::spawn(Self::reader_loop(ws_read, event_tx, pending))
+            let cdp_log = open_cdp_log();
+            tokio::spawn(Self::reader_loop(ws_read, event_tx, pending, cdp_log))
         };
 
         let writer_handle = {
             let pending = Arc::clone(&pending);
-            tokio::spawn(Self::writer_loop(ws_write, command_rx, pending))
+            let cdp_log_out = open_cdp_log();
+            tokio::spawn(Self::writer_loop(ws_write, command_rx, pending, cdp_log_out))
         };
 
         Ok(Self {
@@ -124,6 +139,7 @@ impl Transport {
         mut ws_read: S,
         event_tx: broadcast::Sender<Event>,
         pending: Arc<tokio::sync::Mutex<PendingMap>>,
+        mut cdp_log: Option<std::fs::File>,
     ) where
         S: StreamExt<Item = Result<tungstenite::Message, tungstenite::Error>> + Unpin,
     {
@@ -133,6 +149,11 @@ impl Transport {
                 Ok(tungstenite::Message::Close(_)) | Err(_) => break,
                 Ok(_) => continue, // Binary, ping, pong — ignore.
             };
+
+            // Log raw CDP message if logging is enabled.
+            if let Some(ref mut log) = cdp_log {
+                let _ = writeln!(log, "{msg}");
+            }
 
             let raw: RawMessage = match serde_json::from_str(&msg) {
                 Ok(r) => r,
@@ -163,6 +184,7 @@ impl Transport {
             oneshot::Sender<Result<Value, protocol::WireError>>,
         )>,
         pending: Arc<tokio::sync::Mutex<PendingMap>>,
+        mut cdp_log: Option<std::fs::File>,
     ) where
         S: SinkExt<tungstenite::Message> + Unpin,
     {
@@ -179,6 +201,11 @@ impl Transport {
 
             // Register the pending response before sending.
             pending.lock().await.insert(id, response_tx);
+
+            // Log outgoing command if logging is enabled.
+            if let Some(ref mut log) = cdp_log {
+                let _ = writeln!(log, ">>> {json}");
+            }
 
             let msg = tungstenite::Message::Text(json.into());
             if ws_write.send(msg).await.is_err() {

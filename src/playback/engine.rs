@@ -33,37 +33,6 @@ fn needs_row_gate(speed: PlaybackSpeed) -> bool {
     speed == PlaybackSpeed::Row
 }
 
-/// Find the effective step count for the last row.
-///
-/// On the last row, trailing non-Type steps (Click + `WaitForNavigation`) that
-/// reset to the form for the next row are unnecessary. This returns the index
-/// *after* the last step that should execute: everything through the first
-/// `WaitForNavigation` that follows the last Type step (so the final submission
-/// completes), but nothing after that.
-///
-/// Returns `steps.len()` when there are no trailing reset steps to skip.
-#[must_use]
-fn last_data_step_bound(steps: &[Step]) -> usize {
-    // Find the index of the last Type step.
-    let Some(last_type) = steps.iter().rposition(|s| matches!(s, Step::Type { .. })) else {
-        return steps.len();
-    };
-
-    // Include everything through the first WaitForNavigation after that
-    // Type step (this is the form submission navigation).
-    let after_last_type = &steps[last_type + 1..];
-    if let Some(nav_offset) = after_last_type
-        .iter()
-        .position(|s| matches!(s, Step::WaitForNavigation))
-    {
-        // Include up to and including the WaitForNavigation.
-        last_type + 1 + nav_offset + 1
-    } else {
-        // No WaitForNavigation after the last Type — run all steps.
-        steps.len()
-    }
-}
-
 // ─── Internal executor abstraction ───────────────────────────────────────
 
 /// Abstracts step execution so the engine loop can be tested without a browser.
@@ -292,19 +261,7 @@ impl PlaybackEngine {
         row_index: usize,
         row: &[String],
     ) -> Result<RowOutcome, PlaybackError> {
-        let step_count = self.workflow.steps.len();
-        let is_last_row = row_index + 1 >= self.data.row_count();
-
-        // On the last row, find the cutoff point: skip trailing non-Type
-        // steps (Click + WaitForNavigation) that only exist to navigate
-        // back to the form for the next row. We keep everything through
-        // the last WaitForNavigation that follows a Type step, so the
-        // final submission still goes through.
-        let effective_step_count = if is_last_row {
-            last_data_step_bound(&self.workflow.steps)
-        } else {
-            step_count
-        };
+        let effective_step_count = self.workflow.steps.len();
 
         // Carries a pre-subscribed CDP event receiver from the step before a
         // WaitForNavigation step to the WaitForNavigation step itself.
@@ -318,7 +275,7 @@ impl PlaybackEngine {
             // If the *next* step is WaitForNavigation, subscribe to CDP events
             // now — before executing the current step — to avoid the race
             // between the navigation trigger (e.g. a Click) and our subscription.
-            let next_is_nav = step_index + 1 < step_count
+            let next_is_nav = step_index + 1 < effective_step_count
                 && matches!(self.workflow.steps[step_index + 1], Step::WaitForNavigation);
             if next_is_nav {
                 pending_subscription = executor.subscribe();
@@ -575,65 +532,6 @@ mod tests {
         assert!(!needs_row_gate(PlaybackSpeed::Manual));
         assert!(!needs_row_gate(PlaybackSpeed::Cell));
         assert!(!needs_row_gate(PlaybackSpeed::Auto));
-    }
-
-    // ── Last-row step bound tests ─────────────────────────────────────────
-
-    #[test]
-    fn last_data_step_bound_skips_trailing_reset() {
-        // Type, Click(submit), WaitForNav, Click(back), WaitForNav
-        let steps = vec![
-            type_step(),
-            click_step(),
-            wait_for_navigation_step(),
-            click_step(),
-            wait_for_navigation_step(),
-        ];
-        // Should include through the first WaitForNav after Type (index 2),
-        // skipping the trailing Click + WaitForNav (indices 3, 4).
-        assert_eq!(last_data_step_bound(&steps), 3);
-    }
-
-    #[test]
-    fn last_data_step_bound_no_trailing_reset() {
-        // Type, Click(submit), WaitForNav — nothing to skip.
-        let steps = vec![type_step(), click_step(), wait_for_navigation_step()];
-        assert_eq!(last_data_step_bound(&steps), 3);
-    }
-
-    #[test]
-    fn last_data_step_bound_no_nav_after_type() {
-        // Type, Type — no WaitForNav at all, run everything.
-        let steps = vec![type_step(), type_step()];
-        assert_eq!(last_data_step_bound(&steps), 2);
-    }
-
-    #[test]
-    fn last_data_step_bound_no_type_steps() {
-        // Click, WaitForNav — no Type steps, run everything.
-        let steps = vec![click_step(), wait_for_navigation_step()];
-        assert_eq!(last_data_step_bound(&steps), 2);
-    }
-
-    #[test]
-    fn last_data_step_bound_empty() {
-        assert_eq!(last_data_step_bound(&[]), 0);
-    }
-
-    #[test]
-    fn last_data_step_bound_multiple_type_steps_with_reset() {
-        // Type, Type, Click, WaitForNav, Click, WaitForNav
-        let steps = vec![
-            type_step(),
-            type_step(),
-            click_step(),
-            wait_for_navigation_step(),
-            click_step(),
-            wait_for_navigation_step(),
-        ];
-        // Last Type is index 1. First WaitForNav after it is index 3.
-        // Skip indices 4, 5.
-        assert_eq!(last_data_step_bound(&steps), 4);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────

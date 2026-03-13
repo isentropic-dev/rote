@@ -197,6 +197,6 @@ mod tests {
         };
         let js = resolution_js(&r, "INPUT");
         // serde_json escapes the string — no raw quotes or apostrophes in the value.
-        assert!(!js.contains(r#"getElementById(it's"#));
+        assert!(!js.contains(r"getElementById(it's"));
     }
 }

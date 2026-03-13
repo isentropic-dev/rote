@@ -69,7 +69,7 @@ pub async fn run(
     loop {
         terminal.draw(|frame| draw(frame, &state))?;
 
-        if state.finished || engine_done {
+        if state.finished {
             break;
         }
 
@@ -85,7 +85,7 @@ pub async fn run(
                     break;
                 }
             }
-            maybe_event = event_rx.recv(), if !engine_done => {
+            maybe_event = event_rx.recv() => {
                 let Some(event) = maybe_event else {
                     // Engine dropped the sender without sending Finished.
                     engine_done = true;
@@ -105,7 +105,7 @@ pub async fn run(
                     }
                     continue;
                 };
-                handle_playback_event(event, &mut state, &control_tx);
+                handle_playback_event(event, &mut state);
                 if state.finished {
                     engine_done = true;
                 }
@@ -145,6 +145,17 @@ struct PlaybackScreenState {
     status: String,
     finished: bool,
     error: Option<String>,
+    /// Engine is paused at a confirmation gate (Cell or Row speed).
+    waiting_for_confirmation: bool,
+    /// Engine hit an error and is waiting for the user to choose an action.
+    error_prompt: Option<ErrorPrompt>,
+}
+
+/// State for the interactive error prompt.
+struct ErrorPrompt {
+    row_index: usize,
+    step_index: usize,
+    error: String,
 }
 
 impl PlaybackScreenState {
@@ -169,6 +180,8 @@ impl PlaybackScreenState {
             status: format!("Playing {playback_rows} rows..."),
             finished: false,
             error: None,
+            waiting_for_confirmation: false,
+            error_prompt: None,
         }
     }
 }
@@ -182,31 +195,87 @@ fn handle_key_event(
         return false;
     };
 
-    if key.code == KeyCode::Char('q')
-        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-    {
-        if state.finished {
-            return true;
+    // Ctrl-C always quits.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if !state.finished {
+            let _ = control_tx.send(PlaybackControl::ErrorResponse(ErrorAction::Stop));
         }
+        return true;
+    }
+
+    // If finished, only 'q' exits.
+    if state.finished {
+        return key.code == KeyCode::Char('q');
+    }
+
+    // ── Error prompt mode ─────────────────────────────────────────────
+    if state.error_prompt.is_some() {
+        match key.code {
+            KeyCode::Char('s') => {
+                state.error_prompt = None;
+                let _ = control_tx.send(PlaybackControl::ErrorResponse(ErrorAction::SkipRow));
+            }
+            KeyCode::Char('r') => {
+                state.error_prompt = None;
+                let _ = control_tx.send(PlaybackControl::ErrorResponse(ErrorAction::RetryRow));
+            }
+            KeyCode::Char('q') => {
+                if let Some(prompt) = state.error_prompt.take() {
+                    state.error = Some(prompt.error);
+                }
+                let _ = control_tx.send(PlaybackControl::ErrorResponse(ErrorAction::Stop));
+                return true;
+            }
+            _ => {}
+        }
+        return false;
+    }
+
+    // ── Normal playback mode ──────────────────────────────────────────
+
+    // Quit / stop.
+    if key.code == KeyCode::Char('q') {
         let _ = control_tx.send(PlaybackControl::ErrorResponse(ErrorAction::Stop));
         return true;
     }
 
-    // Pause / resume: space bar toggles between Auto and Manual.
-    if key.code == KeyCode::Char(' ') && !state.finished {
+    // Space: pause ↔ resume.
+    if key.code == KeyCode::Char(' ') {
         if state.speed == PlaybackSpeed::Manual {
             state.speed = PlaybackSpeed::Auto;
             let _ = control_tx.send(PlaybackControl::SetSpeed(PlaybackSpeed::Auto));
             let _ = control_tx.send(PlaybackControl::Proceed);
+            state.waiting_for_confirmation = false;
         } else {
             let _ = control_tx.send(PlaybackControl::Pause);
             state.speed = PlaybackSpeed::Manual;
         }
+        return false;
     }
 
-    // Step forward when paused.
-    if key.code == KeyCode::Enter && state.speed == PlaybackSpeed::Manual && !state.finished {
+    // Enter: proceed past a confirmation gate.
+    if key.code == KeyCode::Enter && state.waiting_for_confirmation {
         let _ = control_tx.send(PlaybackControl::Proceed);
+        state.waiting_for_confirmation = false;
+        return false;
+    }
+
+    // Direct speed selection: 1/2/3/4 → Manual/Cell/Row/Auto.
+    let new_speed = match key.code {
+        KeyCode::Char('1') => Some(PlaybackSpeed::Manual),
+        KeyCode::Char('2') => Some(PlaybackSpeed::Cell),
+        KeyCode::Char('3') => Some(PlaybackSpeed::Row),
+        KeyCode::Char('4') => Some(PlaybackSpeed::Auto),
+        _ => None,
+    };
+    if let Some(speed) = new_speed {
+        state.speed = speed;
+        let _ = control_tx.send(PlaybackControl::SetSpeed(speed));
+        // If we switched away from Manual while at a gate, auto-proceed.
+        if speed != PlaybackSpeed::Manual && state.waiting_for_confirmation {
+            let _ = control_tx.send(PlaybackControl::Proceed);
+            state.waiting_for_confirmation = false;
+        }
     }
 
     false
@@ -215,7 +284,6 @@ fn handle_key_event(
 fn handle_playback_event(
     event: PlaybackEvent,
     state: &mut PlaybackScreenState,
-    control_tx: &mpsc::UnboundedSender<PlaybackControl>,
 ) {
     match event {
         PlaybackEvent::RowStarted { row_index } => {
@@ -230,8 +298,16 @@ fn handle_playback_event(
         PlaybackEvent::StepStarted { step_index, .. } => {
             state.current_step = step_index;
         }
-        PlaybackEvent::StepCompleted { .. }
-        | PlaybackEvent::WaitingForConfirmation => {}
+        PlaybackEvent::StepCompleted { .. } => {}
+        PlaybackEvent::WaitingForConfirmation => {
+            state.waiting_for_confirmation = true;
+            state.status = match state.speed {
+                PlaybackSpeed::Manual => "Paused. [Enter] step forward, [Space] resume.".to_owned(),
+                PlaybackSpeed::Cell => "Waiting for confirmation. [Enter] next field.".to_owned(),
+                PlaybackSpeed::Row => "Row complete. [Enter] next row.".to_owned(),
+                PlaybackSpeed::Auto => "Waiting...".to_owned(),
+            };
+        }
         PlaybackEvent::SpeedChanged(speed) => {
             state.speed = speed;
         }
@@ -250,10 +326,16 @@ fn handle_playback_event(
                 step_index + 1,
             );
             state.row_log.push(msg);
-            state.error = Some(error);
-            state.status = format!("Error on row {}. Stopping.", row_index + 1);
-            // Stop playback on error.
-            let _ = control_tx.send(PlaybackControl::ErrorResponse(ErrorAction::Stop));
+            state.status = format!(
+                "Error on row {}, step {}.",
+                row_index + 1,
+                step_index + 1,
+            );
+            state.error_prompt = Some(ErrorPrompt {
+                row_index,
+                step_index,
+                error,
+            });
         }
         PlaybackEvent::Finished {
             rows_completed,
@@ -301,18 +383,32 @@ async fn wait_for_quit(
 // ─── Drawing ──────────────────────────────────────────────────────────────
 
 fn draw(frame: &mut Frame, state: &PlaybackScreenState) {
+    let has_error_prompt = state.error_prompt.is_some();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(6),
-            Constraint::Length(4),
-        ])
+        .constraints(if has_error_prompt {
+            vec![
+                Constraint::Length(4),
+                Constraint::Min(4),
+                Constraint::Length(5),
+                Constraint::Length(4),
+            ]
+        } else {
+            vec![
+                Constraint::Length(4),
+                Constraint::Min(6),
+                Constraint::Length(0),
+                Constraint::Length(4),
+            ]
+        })
         .split(frame.area());
 
     draw_header(frame, chunks[0], state);
     draw_progress(frame, chunks[1], state);
-    draw_status(frame, chunks[2], state);
+    if has_error_prompt {
+        draw_error_prompt(frame, chunks[2], state);
+    }
+    draw_status(frame, chunks[3], state);
 }
 
 fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackScreenState) {
@@ -399,30 +495,99 @@ fn speed_label(speed: PlaybackSpeed) -> &'static str {
     }
 }
 
+fn draw_error_prompt(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackScreenState) {
+    let Some(prompt) = &state.error_prompt else {
+        return;
+    };
+
+    let lines = vec![
+        Line::from(format!(
+            "Row {}, step {}: {}",
+            prompt.row_index + 1,
+            prompt.step_index + 1,
+            prompt.error,
+        ))
+        .style(Style::default().fg(Color::Red)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[s]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Skip this row   "),
+            Span::styled("[r]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Retry from step 1   "),
+            Span::styled("[q]", Style::default().fg(Color::Red)),
+            Span::raw(" Stop playback"),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Error ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
+}
+
 fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackScreenState) {
     let hint: Vec<Span<'_>> = if state.finished {
         vec![
             Span::styled("[q]", Style::default().fg(Color::Red)),
             Span::raw(" Quit"),
         ]
-    } else if state.speed == PlaybackSpeed::Manual {
+    } else if state.error_prompt.is_some() {
         vec![
+            Span::styled("[s]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Skip row   "),
+            Span::styled("[r]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Retry row   "),
+            Span::styled("[q]", Style::default().fg(Color::Red)),
+            Span::raw(" Stop"),
+        ]
+    } else if state.waiting_for_confirmation {
+        let mut spans = vec![
+            Span::raw(format!("Speed: {} ", speed_label(state.speed))),
+            Span::styled("[Enter]", Style::default().fg(Color::Green)),
+            Span::raw(" Proceed   "),
+        ];
+        if state.speed == PlaybackSpeed::Manual {
+            spans.extend([
+                Span::styled("[Space]", Style::default().fg(Color::Green)),
+                Span::raw(" Resume   "),
+            ]);
+        }
+        spans.extend(speed_key_hints());
+        spans.extend([
+            Span::styled("[q]", Style::default().fg(Color::Red)),
+            Span::raw(" Stop"),
+        ]);
+        spans
+    } else if state.speed == PlaybackSpeed::Manual {
+        let mut spans = vec![
             Span::raw(format!("Speed: {} ", speed_label(state.speed))),
             Span::styled("[Space]", Style::default().fg(Color::Green)),
             Span::raw(" Resume   "),
-            Span::styled("[Enter]", Style::default().fg(Color::Green)),
-            Span::raw(" Step   "),
+        ];
+        spans.extend(speed_key_hints());
+        spans.extend([
             Span::styled("[q]", Style::default().fg(Color::Red)),
             Span::raw(" Stop"),
-        ]
+        ]);
+        spans
     } else {
-        vec![
+        let mut spans = vec![
             Span::raw(format!("Speed: {} ", speed_label(state.speed))),
             Span::styled("[Space]", Style::default().fg(Color::Green)),
             Span::raw(" Pause   "),
+        ];
+        spans.extend(speed_key_hints());
+        spans.extend([
             Span::styled("[q]", Style::default().fg(Color::Red)),
             Span::raw(" Stop"),
-        ]
+        ]);
+        spans
     };
 
     let lines = vec![
@@ -438,6 +603,14 @@ fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackS
     );
 
     frame.render_widget(paragraph, area);
+}
+
+/// Hint spans for the 1/2/3/4 speed keys.
+fn speed_key_hints() -> Vec<Span<'static>> {
+    vec![
+        Span::styled("[1-4]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Speed   "),
+    ]
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────

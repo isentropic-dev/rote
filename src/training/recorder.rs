@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn non_recorder_message_ignored() {
-        let params = console_event(r##"{"message": "hello world"}"##);
+        let params = console_event(r#"{"message": "hello world"}"#);
         assert!(parse_recorder_event(&params).is_none());
     }
 
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn null_selector_fields_handled() {
-        let json = r##"{"__rote":true,"type":"click","tagName":"DIV","selector":{"id":null,"css":"div.content","xpath":"//div","textContent":null}}"##;
+        let json = r#"{"__rote":true,"type":"click","tagName":"DIV","selector":{"id":null,"css":"div.content","xpath":"//div","textContent":null}}"#;
         let params = console_event(json);
         let cmd = parse_recorder_event(&params).unwrap();
 
