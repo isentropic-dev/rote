@@ -3,7 +3,7 @@
 // These types are shared between the training recorder and future playback.
 // They serialize to JSON workflow files.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::{fs, io};
 
@@ -58,8 +58,13 @@ pub enum Step {
         selector: Selector,
         source: ValueSource,
     },
-    /// Navigate to a URL.
-    Navigate { url: String },
+    /// Wait for a browser navigation to complete.
+    ///
+    /// This step does not trigger navigation itself; it waits for a navigation
+    /// that was triggered by the previous step (typically a form submit or
+    /// click). The engine pre-subscribes to CDP events before executing the
+    /// previous step to avoid a race condition.
+    WaitForNavigation,
 }
 
 /// What to do when a cell is blank for a bound column.
@@ -105,11 +110,13 @@ pub struct Workflow {
     pub column_count: usize,
     /// The recorded sequence of actions.
     pub steps: Vec<Step>,
-    /// Column index → step index mapping. `None` means unbound.
+    /// Per-column binding: `column_bindings[col]` is `Some(step_index)` when
+    /// that column is bound to a [`Step::Type`] step. Always has exactly
+    /// `column_count` entries; `None` means the column is not yet bound.
     pub column_bindings: Vec<Option<usize>>,
     /// Per-column rules for handling empty cells.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub empty_cell_rules: HashMap<usize, EmptyCellRule>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub empty_cell_rules: BTreeMap<usize, EmptyCellRule>,
     /// How the data was originally loaded (so playback can reload it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_source: Option<DataSourceConfig>,
@@ -135,6 +142,12 @@ pub enum WorkflowError {
 
     #[error("empty cell rule references column {column}, but only {column_count} columns exist")]
     InvalidEmptyCellRule { column: usize, column_count: usize },
+
+    #[error("column_bindings has {found} entries but column_count is {expected}")]
+    ColumnBindingLengthMismatch { expected: usize, found: usize },
+
+    #[error("column {column} is bound to step {step_index}, which is not a Type step")]
+    BindingNotTypeStep { column: usize, step_index: usize },
 }
 
 impl Workflow {
@@ -144,7 +157,7 @@ impl Workflow {
         column_count: usize,
         steps: Vec<Step>,
         column_bindings: Vec<Option<usize>>,
-        empty_cell_rules: HashMap<usize, EmptyCellRule>,
+        empty_cell_rules: BTreeMap<usize, EmptyCellRule>,
         data_source: Option<DataSourceConfig>,
     ) -> Self {
         Self {
@@ -212,12 +225,25 @@ impl Workflow {
             });
         }
 
-        for binding in &self.column_bindings {
+        if self.column_bindings.len() != self.column_count {
+            return Err(WorkflowError::ColumnBindingLengthMismatch {
+                expected: self.column_count,
+                found: self.column_bindings.len(),
+            });
+        }
+
+        for (col, binding) in self.column_bindings.iter().enumerate() {
             if let Some(step_index) = binding {
                 if *step_index >= self.steps.len() {
                     return Err(WorkflowError::InvalidBinding {
                         step_index: *step_index,
                         step_count: self.steps.len(),
+                    });
+                }
+                if !matches!(self.steps[*step_index], Step::Type { .. }) {
+                    return Err(WorkflowError::BindingNotTypeStep {
+                        column: col,
+                        step_index: *step_index,
                     });
                 }
             }
@@ -282,11 +308,10 @@ mod tests {
     }
 
     #[test]
-    fn step_navigate_serialization() {
-        let step = Step::Navigate {
-            url: "https://example.com".to_owned(),
-        };
+    fn step_wait_for_navigation_serialization() {
+        let step = Step::WaitForNavigation;
         let json = serde_json::to_string(&step).unwrap();
+        assert!(json.contains(r#""action":"waitForNavigation""#));
         let back: Step = serde_json::from_str(&json).unwrap();
         assert_eq!(back, step);
     }
@@ -322,15 +347,13 @@ mod tests {
     }
 
     fn sample_workflow() -> Workflow {
-        let mut rules = HashMap::new();
+        let mut rules = BTreeMap::new();
         rules.insert(1, EmptyCellRule::Skip);
 
         Workflow::new(
             3,
             vec![
-                Step::Navigate {
-                    url: "https://example.com/form".to_owned(),
-                },
+                Step::WaitForNavigation,
                 Step::Click {
                     selector: Selector {
                         strategies: vec![Resolution::Id {
@@ -373,7 +396,11 @@ mod tests {
             ],
             vec![Some(2), Some(3), None],
             rules,
-            Some(DataSourceConfig::file("data.tsv", crate::data::Delimiter::Tab, true)),
+            Some(DataSourceConfig::file(
+                "data.tsv",
+                crate::data::Delimiter::Tab,
+                true,
+            )),
         )
     }
 
@@ -394,7 +421,7 @@ mod tests {
 
     #[test]
     fn workflow_omits_empty_optional_fields() {
-        let workflow = Workflow::new(1, vec![], vec![None], HashMap::new(), None);
+        let workflow = Workflow::new(1, vec![], vec![None], BTreeMap::new(), None);
         let json = workflow.to_json().unwrap();
         assert!(!json.contains("emptyCellRules"));
         assert!(!json.contains("dataSource"));
@@ -416,7 +443,7 @@ mod tests {
             column_count: 1,
             steps: vec![],
             column_bindings: vec![Some(5)],
-            empty_cell_rules: HashMap::new(),
+            empty_cell_rules: BTreeMap::new(),
             data_source: None,
         };
         let json = serde_json::to_string(&workflow).unwrap();
@@ -426,19 +453,22 @@ mod tests {
 
     #[test]
     fn workflow_invalid_empty_cell_rule() {
-        let mut rules = HashMap::new();
+        let mut rules = BTreeMap::new();
         rules.insert(10, EmptyCellRule::Clear);
         let workflow = Workflow {
             version: 1,
             column_count: 2,
             steps: vec![],
-            column_bindings: vec![],
+            column_bindings: vec![None, None],
             empty_cell_rules: rules,
             data_source: None,
         };
         let json = serde_json::to_string(&workflow).unwrap();
         let err = Workflow::from_json(&json).unwrap_err();
-        assert!(err.to_string().contains("empty cell rule references column 10"));
+        assert!(
+            err.to_string()
+                .contains("empty cell rule references column 10")
+        );
     }
 
     #[test]
@@ -467,5 +497,46 @@ mod tests {
         assert!(json.contains("columnBindings"));
         assert!(json.contains("emptyCellRules"));
         assert!(json.contains("dataSource"));
+    }
+
+    #[test]
+    fn workflow_column_binding_length_mismatch() {
+        let workflow = Workflow {
+            version: 1,
+            column_count: 3,
+            steps: vec![],
+            column_bindings: vec![None, None], // length 2, but column_count is 3
+            empty_cell_rules: BTreeMap::new(),
+            data_source: None,
+        };
+        let json = serde_json::to_string(&workflow).unwrap();
+        let err = Workflow::from_json(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("column_bindings has 2 entries"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn workflow_binding_not_type_step() {
+        let workflow = Workflow {
+            version: 1,
+            column_count: 1,
+            steps: vec![Step::Click {
+                selector: Selector {
+                    strategies: vec![],
+                    tag: "BUTTON".to_owned(),
+                },
+            }],
+            column_bindings: vec![Some(0)], // bound to a Click step, not Type
+            empty_cell_rules: BTreeMap::new(),
+            data_source: None,
+        };
+        let json = serde_json::to_string(&workflow).unwrap();
+        let err = Workflow::from_json(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("not a Type step"),
+            "unexpected error: {err}",
+        );
     }
 }

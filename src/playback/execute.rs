@@ -1,17 +1,14 @@
 // Step execution: perform individual workflow steps against the browser.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-use tokio::sync::broadcast::error::RecvError;
-use tokio::time::Duration;
+use tokio::sync::broadcast::{self, error::RecvError};
 
-use crate::cdp::Browser;
+use crate::cdp::{Browser, Event as CdpEvent};
 use crate::workflow::{EmptyCellRule, Step, ValueSource};
 
-use super::{resolve, PlaybackError};
-
-/// How long to wait for a `Page.frameNavigated` event.
-const NAVIGATE_TIMEOUT: Duration = Duration::from_secs(30);
+use super::resolve;
+use super::{PlaybackConfig, PlaybackError};
 
 // ─── Type-value resolution ─────────────────────────────────────────────────
 
@@ -41,7 +38,7 @@ pub(crate) enum StepOutcome {
 pub(crate) fn resolve_type_value(
     source: &ValueSource,
     row: &[String],
-    rules: &HashMap<usize, EmptyCellRule>,
+    rules: &BTreeMap<usize, EmptyCellRule>,
 ) -> TypeAction {
     match source {
         ValueSource::Literal { value } => TypeAction::Type(value.clone()),
@@ -70,11 +67,18 @@ pub(crate) fn resolve_type_value(
 ///
 /// - [`PlaybackError::ElementNotFound`] — element could not be resolved.
 /// - [`PlaybackError::Cdp`] — a CDP command failed.
-async fn execute_click(browser: &Browser, step: &Step) -> Result<(), PlaybackError> {
+async fn execute_click(
+    browser: &Browser,
+    step: &Step,
+    config: &PlaybackConfig,
+) -> Result<(), PlaybackError> {
     let Step::Click { selector } = step else {
-        return Err(PlaybackError::Other("execute_click called with non-Click step".to_owned()));
+        // Unreachable: caller dispatches by step variant.
+        return Err(PlaybackError::Other(
+            "execute_click called with non-Click step".to_owned(),
+        ));
     };
-    resolve::resolve_element(browser, selector).await?;
+    resolve::resolve_element(browser, selector, config.element_timeout).await?;
     browser.evaluate("window.__roteTarget.click()").await?;
     Ok(())
 }
@@ -89,10 +93,14 @@ async fn execute_type(
     browser: &Browser,
     step: &Step,
     row: &[String],
-    rules: &HashMap<usize, EmptyCellRule>,
+    rules: &BTreeMap<usize, EmptyCellRule>,
+    config: &PlaybackConfig,
 ) -> Result<StepOutcome, PlaybackError> {
     let Step::Type { selector, source } = step else {
-        return Err(PlaybackError::Other("execute_type called with non-Type step".to_owned()));
+        // Unreachable: caller dispatches by step variant.
+        return Err(PlaybackError::Other(
+            "execute_type called with non-Type step".to_owned(),
+        ));
     };
 
     let action = resolve_type_value(source, row, rules);
@@ -101,7 +109,7 @@ async fn execute_type(
         TypeAction::Skip => return Ok(StepOutcome::Skipped),
 
         TypeAction::Type(value) => {
-            resolve::resolve_element(browser, selector).await?;
+            resolve::resolve_element(browser, selector, config.element_timeout).await?;
 
             // Focus the element.
             browser.evaluate("window.__roteTarget.focus()").await?;
@@ -128,24 +136,34 @@ async fn execute_type(
     Ok(StepOutcome::Executed)
 }
 
-/// Execute a [`Step::Navigate`] step.
+/// Execute a [`Step::WaitForNavigation`] step.
 ///
 /// Waits passively for the browser to fire a `Page.frameNavigated` event on
 /// the main frame (triggered by the previous step, typically a form submit).
 ///
+/// `pre_subscribed` is a receiver that was subscribed *before* the triggering
+/// step executed, ensuring we cannot miss the event. If `None`, a fresh
+/// subscription is created (which risks a race with a fast navigation).
+///
 /// # Errors
 ///
-/// - [`PlaybackError::NavigationTimeout`] — no navigation within 30 seconds.
+/// - [`PlaybackError::NavigationTimeout`] — no navigation within the configured timeout.
 /// - [`PlaybackError::Other`] — the CDP event channel closed.
-async fn execute_navigate(browser: &Browser) -> Result<(), PlaybackError> {
-    let mut events = browser.subscribe();
+async fn execute_wait_for_navigation(
+    browser: &Browser,
+    pre_subscribed: Option<broadcast::Receiver<CdpEvent>>,
+    config: &PlaybackConfig,
+) -> Result<(), PlaybackError> {
+    let mut events = pre_subscribed.unwrap_or_else(|| browser.subscribe());
 
-    tokio::time::timeout(NAVIGATE_TIMEOUT, async {
+    tokio::time::timeout(config.navigation_timeout, async {
         loop {
             match events.recv().await {
                 Ok(event) => {
                     if event.method == "Page.frameNavigated" {
-                        // A main frame navigation has no `parentId` on the frame.
+                        // Main-frame detection: a main-frame navigation has no
+                        // `parentId` on the frame. This is validated at the CDP
+                        // event parsing level; sub-frame navigations are ignored.
                         let is_main_frame = event
                             .params
                             .get("frame")
@@ -178,6 +196,9 @@ async fn execute_navigate(browser: &Browser) -> Result<(), PlaybackError> {
 /// Returns [`StepOutcome::Skipped`] when an empty-cell rule suppresses the
 /// step; [`StepOutcome::Executed`] when the step ran normally.
 ///
+/// `pre_subscribed` is forwarded to [`Step::WaitForNavigation`] steps so they
+/// can use a receiver that was opened before the triggering step ran.
+///
 /// # Errors
 ///
 /// - [`PlaybackError::ElementNotFound`] — element not found within timeout.
@@ -188,16 +209,18 @@ pub(crate) async fn execute_step(
     browser: &Browser,
     step: &Step,
     row: &[String],
-    rules: &HashMap<usize, EmptyCellRule>,
+    rules: &BTreeMap<usize, EmptyCellRule>,
+    pre_subscribed: Option<broadcast::Receiver<CdpEvent>>,
+    config: &PlaybackConfig,
 ) -> Result<StepOutcome, PlaybackError> {
     match step {
         Step::Click { .. } => {
-            execute_click(browser, step).await?;
+            execute_click(browser, step, config).await?;
             Ok(StepOutcome::Executed)
         }
-        Step::Type { .. } => execute_type(browser, step, row, rules).await,
-        Step::Navigate { .. } => {
-            execute_navigate(browser).await?;
+        Step::Type { .. } => execute_type(browser, step, row, rules, config).await,
+        Step::WaitForNavigation => {
+            execute_wait_for_navigation(browser, pre_subscribed, config).await?;
             Ok(StepOutcome::Executed)
         }
     }
@@ -210,7 +233,7 @@ mod tests {
     use super::*;
     use crate::workflow::{EmptyCellRule, ValueSource};
 
-    fn make_rules(pairs: &[(usize, EmptyCellRule)]) -> HashMap<usize, EmptyCellRule> {
+    fn make_rules(pairs: &[(usize, EmptyCellRule)]) -> BTreeMap<usize, EmptyCellRule> {
         pairs.iter().cloned().collect()
     }
 
@@ -272,7 +295,12 @@ mod tests {
     fn empty_column_default_rule_uses_default() {
         let source = ValueSource::Column { index: 2 };
         let row = vec!["a".to_owned(), "b".to_owned(), String::new()];
-        let rules = make_rules(&[(2, EmptyCellRule::Default { value: "N/A".to_owned() })]);
+        let rules = make_rules(&[(
+            2,
+            EmptyCellRule::Default {
+                value: "N/A".to_owned(),
+            },
+        )]);
         assert_eq!(
             resolve_type_value(&source, &row, &rules),
             TypeAction::Type("N/A".to_owned()),
@@ -283,7 +311,12 @@ mod tests {
     fn out_of_bounds_column_treats_as_empty() {
         let source = ValueSource::Column { index: 99 };
         let row = vec!["x".to_owned()];
-        let rules = make_rules(&[(99, EmptyCellRule::Default { value: "X".to_owned() })]);
+        let rules = make_rules(&[(
+            99,
+            EmptyCellRule::Default {
+                value: "X".to_owned(),
+            },
+        )]);
         assert_eq!(
             resolve_type_value(&source, &row, &rules),
             TypeAction::Type("X".to_owned()),

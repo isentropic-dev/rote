@@ -7,16 +7,15 @@ use crate::workflow::{Resolution, Selector};
 
 use super::PlaybackError;
 
-/// How long to keep retrying before giving up.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// How long to wait between retry attempts.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Generate a self-invoking JS expression for one resolution strategy.
 ///
 /// On success the expression evaluates to `true` and stores the element in
-/// `window.__roteTarget`. On failure it evaluates to `false`.
+/// `window.__roteTarget` — a well-known global used by subsequent JS steps
+/// (`click()`, `focus()`, etc.) to act on the resolved element. On failure
+/// it evaluates to `false`.
 ///
 /// `tag` is the expected HTML tag name (e.g. `"INPUT"`, `"BUTTON"`) and is
 /// used only for the [`Resolution::TextContent`] strategy.
@@ -25,23 +24,23 @@ pub(crate) fn resolution_js(resolution: &Resolution, tag: &str) -> String {
     match resolution {
         Resolution::Id { id } => format!(
             "(function(){{var e=document.getElementById({id});if(e){{window.__roteTarget=e;return true;}}return false;}})()",
-            id = serde_json::to_string(id).unwrap_or_default(),
+            id = serde_json::to_string(id).expect("String serialization is infallible"),
         ),
 
         Resolution::Css { selector } => format!(
             "(function(){{var e=document.querySelector({sel});if(e){{window.__roteTarget=e;return true;}}return false;}})()",
-            sel = serde_json::to_string(selector).unwrap_or_default(),
+            sel = serde_json::to_string(selector).expect("String serialization is infallible"),
         ),
 
         Resolution::XPath { path } => format!(
             "(function(){{var e=document.evaluate({path},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue;if(e){{window.__roteTarget=e;return true;}}return false;}})()",
-            path = serde_json::to_string(path).unwrap_or_default(),
+            path = serde_json::to_string(path).expect("String serialization is infallible"),
         ),
 
         Resolution::TextContent { text } => format!(
             "(function(){{var es=document.getElementsByTagName({tag});for(var i=0;i<es.length;i++){{if(es[i].textContent.trim()==={text}){{window.__roteTarget=es[i];return true;}}}}return false;}})()",
-            tag  = serde_json::to_string(tag).unwrap_or_default(),
-            text = serde_json::to_string(text).unwrap_or_default(),
+            tag = serde_json::to_string(tag).expect("String serialization is infallible"),
+            text = serde_json::to_string(text).expect("String serialization is infallible"),
         ),
     }
 }
@@ -49,48 +48,63 @@ pub(crate) fn resolution_js(resolution: &Resolution, tag: &str) -> String {
 /// Try each resolution strategy in `selector` until one locates the element.
 ///
 /// On success, `window.__roteTarget` holds the element in the browser page.
-/// Retries every [`POLL_INTERVAL`] until [`DEFAULT_TIMEOUT`] is exceeded.
+/// The entire resolution loop is wrapped in a `tokio::time::timeout` of
+/// `timeout_duration`. Retries every [`POLL_INTERVAL`] within that window.
 ///
 /// # Errors
 ///
-/// - [`PlaybackError::ElementNotFound`] — no strategy succeeded within the timeout.
+/// - [`PlaybackError::ElementNotFound`] — no strategy succeeded within the timeout,
+///   or the strategy list is empty.
 /// - [`PlaybackError::Cdp`] — a CDP command failed.
 pub(crate) async fn resolve_element(
     browser: &Browser,
     selector: &Selector,
+    timeout_duration: Duration,
 ) -> Result<(), PlaybackError> {
-    let deadline = tokio::time::Instant::now() + DEFAULT_TIMEOUT;
-
-    loop {
-        for resolution in &selector.strategies {
-            let js = resolution_js(resolution, &selector.tag);
-            let response = browser.evaluate(&js).await?;
-
-            // Runtime.evaluate returns {"result": {"type": ..., "value": ...}}.
-            let found = response
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-
-            if found {
-                return Ok(());
-            }
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-
-        tokio::time::sleep(POLL_INTERVAL).await;
+    // Fail fast: no point entering the retry loop with nothing to try.
+    if selector.strategies.is_empty() {
+        return Err(PlaybackError::ElementNotFound(format!(
+            "selector has no strategies (tag: {})",
+            selector.tag,
+        )));
     }
 
-    Err(PlaybackError::ElementNotFound(format!(
-        "selector with {} strateg{} (tag: {})",
-        selector.strategies.len(),
-        if selector.strategies.len() == 1 { "y" } else { "ies" },
-        selector.tag,
-    )))
+    let result = tokio::time::timeout(timeout_duration, async {
+        loop {
+            for resolution in &selector.strategies {
+                let js = resolution_js(resolution, &selector.tag);
+                let response = browser.evaluate(&js).await?;
+
+                // Runtime.evaluate returns {"result": {"type": ..., "value": ...}}.
+                let found = response
+                    .get("result")
+                    .and_then(|r| r.get("value"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+
+                if found {
+                    return Ok(());
+                }
+            }
+
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_elapsed) => Err(PlaybackError::ElementNotFound(format!(
+            "selector with {} strateg{} (tag: {}) not found within {timeout_duration:.1?}",
+            selector.strategies.len(),
+            if selector.strategies.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            selector.tag,
+        ))),
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -153,9 +167,7 @@ mod tests {
     #[test]
     fn js_returns_true_and_false_branches() {
         for resolution in &[
-            Resolution::Id {
-                id: "x".to_owned(),
-            },
+            Resolution::Id { id: "x".to_owned() },
             Resolution::Css {
                 selector: ".x".to_owned(),
             },
@@ -167,8 +179,14 @@ mod tests {
             },
         ] {
             let js = resolution_js(resolution, "INPUT");
-            assert!(has_snippet(&js, "return true;"), "missing true branch: {js}");
-            assert!(has_snippet(&js, "return false;"), "missing false branch: {js}");
+            assert!(
+                has_snippet(&js, "return true;"),
+                "missing true branch: {js}"
+            );
+            assert!(
+                has_snippet(&js, "return false;"),
+                "missing false branch: {js}"
+            );
         }
     }
 

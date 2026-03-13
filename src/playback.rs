@@ -8,6 +8,8 @@ mod resolve;
 
 pub use engine::{PlaybackEngine, PlaybackResult};
 
+use std::time::Duration;
+
 use crate::cdp::CdpError;
 
 /// Errors that can occur during playback.
@@ -50,6 +52,10 @@ pub enum PlaybackControl {
 }
 
 /// What to do when a step fails during playback.
+///
+/// TODO: add `SkipStep` to skip only the failing step without discarding the
+/// entire row. This is useful for optional fields where a single failure
+/// should not forfeit the whole row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorAction {
     /// Skip the current row and continue with the next.
@@ -58,6 +64,24 @@ pub enum ErrorAction {
     RetryRow,
     /// Stop playback entirely.
     Stop,
+}
+
+/// Configuration knobs for the playback engine.
+#[derive(Debug, Clone)]
+pub struct PlaybackConfig {
+    /// How long to keep retrying element resolution before giving up.
+    pub element_timeout: Duration,
+    /// How long to wait for a `Page.frameNavigated` event after a triggering step.
+    pub navigation_timeout: Duration,
+}
+
+impl Default for PlaybackConfig {
+    fn default() -> Self {
+        Self {
+            element_timeout: Duration::from_secs(5),
+            navigation_timeout: Duration::from_secs(30),
+        }
+    }
 }
 
 /// Progress events emitted by the playback engine to the TUI or CLI.

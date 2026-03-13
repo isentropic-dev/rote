@@ -1,11 +1,11 @@
 // Training core state machine implementation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 
 use tokio::sync::mpsc;
 
-use crate::data::DataSet;
-use crate::workflow::{EmptyCellRule, PlaybackSpeed, Step, ValueSource};
+use crate::data::{DataSet, DataSourceConfig};
+use crate::workflow::{EmptyCellRule, PlaybackSpeed, Step, ValueSource, Workflow};
 
 use super::{Command, SelectorInfo, TrainingEvent};
 
@@ -21,7 +21,7 @@ pub struct TrainingCore {
     step_selectors: Vec<Option<SelectorInfo>>,
     /// `column_bindings[col]` = the step index that column is bound to.
     column_bindings: Vec<Option<usize>>,
-    empty_cell_rules: HashMap<usize, EmptyCellRule>,
+    empty_cell_rules: BTreeMap<usize, EmptyCellRule>,
     speed: PlaybackSpeed,
     event_tx: mpsc::UnboundedSender<TrainingEvent>,
 }
@@ -36,13 +36,18 @@ impl TrainingCore {
             steps: Vec::new(),
             step_selectors: Vec::new(),
             column_bindings: vec![None; col_count],
-            empty_cell_rules: HashMap::new(),
+            empty_cell_rules: BTreeMap::new(),
             speed: PlaybackSpeed::default(),
             event_tx,
         }
     }
 
     /// Process a command and emit any resulting events.
+    ///
+    /// This method is synchronous because training sessions are driven by a
+    /// single-threaded event loop in the TUI. All browser events and user
+    /// commands are serialised through this entry point, so there is no risk
+    /// of concurrent mutation.
     pub fn process(&mut self, command: Command) {
         match command {
             Command::BrowserClick { selector_info, tag } => {
@@ -101,6 +106,11 @@ impl TrainingCore {
         &self.column_bindings
     }
 
+    /// The current per-column empty-cell rules.
+    pub fn empty_cell_rules(&self) -> &BTreeMap<usize, EmptyCellRule> {
+        &self.empty_cell_rules
+    }
+
     /// Whether every non-empty column in the current row is bound to a step.
     pub fn is_row_complete(&self) -> bool {
         let Some(row) = self.data.row(self.current_row) else {
@@ -112,6 +122,20 @@ impl TrainingCore {
             }
         }
         true
+    }
+
+    /// Build a [`Workflow`] from the current training state.
+    ///
+    /// The optional `data_source` is embedded in the workflow so that playback
+    /// can reload the data automatically.
+    pub fn build_workflow(&self, data_source: Option<DataSourceConfig>) -> Workflow {
+        Workflow::new(
+            self.data.column_count(),
+            self.steps.clone(),
+            self.column_bindings.clone(),
+            self.empty_cell_rules.clone(),
+            data_source,
+        )
     }
 
     // -- Private handlers --
@@ -180,8 +204,8 @@ impl TrainingCore {
         }
     }
 
-    fn handle_navigation(&mut self, url: String) {
-        let step = Step::Navigate { url };
+    fn handle_navigation(&mut self, _url: String) {
+        let step = Step::WaitForNavigation;
         let index = self.steps.len();
         self.steps.push(step.clone());
         self.step_selectors.push(None);
@@ -190,9 +214,7 @@ impl TrainingCore {
 
     fn handle_advance_row(&mut self) {
         if self.current_row + 1 >= self.data.row_count() {
-            self.emit(TrainingEvent::Error(
-                "Already on the last row".to_owned(),
-            ));
+            self.emit(TrainingEvent::Error("Already on the last row".to_owned()));
             return;
         }
 
@@ -222,19 +244,48 @@ impl TrainingCore {
     }
 
     fn handle_new_field(&mut self, column: usize) {
-        // Bind the column to the most recent Type step that isn't already bound.
-        let last_type_step = self
-            .steps
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, step)| matches!(step, Step::Type { .. }));
+        // Bounds-check first; panic would be wrong for user-driven input.
+        if column >= self.column_bindings.len() {
+            self.emit(TrainingEvent::Error(format!(
+                "column index {column} out of range (have {})",
+                self.column_bindings.len(),
+            )));
+            return;
+        }
 
-        if let Some((idx, _)) = last_type_step {
+        // Collect already-bound step indices so we can skip them.
+        let already_bound: HashSet<usize> =
+            self.column_bindings.iter().filter_map(|b| *b).collect();
+
+        // Find the most recent Type step that is not already bound to a column.
+        // Clone the selector out so we can mutate self.steps afterwards.
+        let found = self.steps.iter().enumerate().rev().find_map(|(i, step)| {
+            if already_bound.contains(&i) {
+                return None;
+            }
+            if let Step::Type { selector, .. } = step {
+                Some((i, selector.clone()))
+            } else {
+                None
+            }
+        });
+
+        if let Some((idx, selector)) = found {
+            // Update the step's source to the new column.
+            let updated = Step::Type {
+                selector,
+                source: ValueSource::Column { index: column },
+            };
+            self.steps[idx] = updated.clone();
+
             self.column_bindings[column] = Some(idx);
             self.emit(TrainingEvent::ColumnBound {
                 column,
                 step_index: idx,
+            });
+            self.emit(TrainingEvent::StepUpdated {
+                index: idx,
+                step: updated,
             });
         }
     }
@@ -245,12 +296,7 @@ impl TrainingCore {
             .iter()
             .enumerate()
             .rev()
-            .find_map(|(i, stored)| {
-                stored
-                    .as_ref()
-                    .filter(|s| s.same_element(info))
-                    .map(|_| i)
-            })
+            .find_map(|(i, stored)| stored.as_ref().filter(|s| s.same_element(info)).map(|_| i))
     }
 
     /// Try to match a value to an unbound column in the current row.
@@ -263,21 +309,30 @@ impl TrainingCore {
         updating_step: Option<usize>,
     ) -> (ValueSource, Option<usize>) {
         let Some(row) = self.data.row(self.current_row) else {
-            return (ValueSource::Literal { value: value.to_owned() }, None);
+            return (
+                ValueSource::Literal {
+                    value: value.to_owned(),
+                },
+                None,
+            );
         };
 
         for (col, cell) in row.iter().enumerate() {
             if cell == value {
                 let binding = self.column_bindings.get(col).copied().flatten();
-                let available = binding.is_none()
-                    || binding == updating_step;
+                let available = binding.is_none() || binding == updating_step;
                 if available {
                     return (ValueSource::Column { index: col }, Some(col));
                 }
             }
         }
 
-        (ValueSource::Literal { value: value.to_owned() }, None)
+        (
+            ValueSource::Literal {
+                value: value.to_owned(),
+            },
+            None,
+        )
     }
 
     /// Remove any column binding that points to the given step index.
@@ -348,7 +403,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            TrainingEvent::StepRecorded { index: 0, step: Step::Click { .. } }
+            TrainingEvent::StepRecorded {
+                index: 0,
+                step: Step::Click { .. }
+            }
         ));
         assert_eq!(core.steps().len(), 1);
     }
@@ -368,7 +426,10 @@ mod tests {
         let events = drain_events(&mut rx);
         assert!(has_event(&events, |e| matches!(
             e,
-            TrainingEvent::ColumnBound { column: 0, step_index: 0 }
+            TrainingEvent::ColumnBound {
+                column: 0,
+                step_index: 0
+            }
         )));
         assert!(has_event(&events, |e| matches!(
             e,
@@ -477,7 +538,10 @@ mod tests {
         let events = drain_events(&mut rx);
         assert!(has_event(&events, |e| matches!(
             e,
-            TrainingEvent::ColumnBound { column: 0, step_index: 0 }
+            TrainingEvent::ColumnBound {
+                column: 0,
+                step_index: 0
+            }
         )));
 
         assert_eq!(core.bound_columns()[0], Some(0));
@@ -560,7 +624,10 @@ mod tests {
         let events = drain_events(&mut rx);
         assert!(has_event(&events, |e| matches!(
             e,
-            TrainingEvent::EmptyCellEncountered { column: 1, row_index: 1 }
+            TrainingEvent::EmptyCellEncountered {
+                column: 1,
+                row_index: 1
+            }
         )));
     }
 
@@ -621,7 +688,7 @@ mod tests {
             e,
             TrainingEvent::StepRecorded {
                 index: 0,
-                step: Step::Navigate { .. }
+                step: Step::WaitForNavigation
             }
         )));
     }
@@ -657,11 +724,169 @@ mod tests {
         core.process(Command::AdvanceRow);
 
         let events = drain_events(&mut rx);
-        assert!(has_event(&events, |e| matches!(
-            e,
-            TrainingEvent::Error(_)
-        )));
+        assert!(has_event(&events, |e| matches!(e, TrainingEvent::Error(_))));
         // Row should not have changed.
         assert_eq!(core.current_row_index(), 0);
+    }
+
+    // -- HandleNewField tests --
+
+    #[test]
+    fn handle_new_field_binds_column_and_updates_source() {
+        // Column 1 is unbound; a Type step exists with a literal value.
+        let ds = test_data("name\tage\nAlice\t\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Record a Type step whose value doesn't match any column.
+        core.process(Command::BrowserInput {
+            selector_info: sel("age-field", "#age-field"),
+            tag: "INPUT".to_owned(),
+            value: "something-else".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // Issue HandleNewField to bind column 1 to that step.
+        core.process(Command::HandleNewField { column: 1 });
+
+        let events = drain_events(&mut rx);
+        assert!(
+            has_event(&events, |e| matches!(
+                e,
+                TrainingEvent::ColumnBound {
+                    column: 1,
+                    step_index: 0
+                }
+            )),
+            "expected ColumnBound event",
+        );
+
+        // The step's source should now be Column { index: 1 }.
+        match &core.steps()[0] {
+            Step::Type { source, .. } => {
+                assert_eq!(*source, ValueSource::Column { index: 1 });
+            }
+            _ => panic!("expected Type step"),
+        }
+
+        // The binding should be recorded.
+        assert_eq!(core.bound_columns()[1], Some(0));
+    }
+
+    #[test]
+    fn handle_new_field_skips_already_bound_steps() {
+        // Two Type steps; first is bound to column 0, second is unbound.
+        let ds = test_data("first\tsecond\nAlice\t\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Bind column 0 to step 0.
+        core.process(Command::BrowserInput {
+            selector_info: sel("first-field", "#first-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        // Record a second Type step (not bound).
+        core.process(Command::BrowserInput {
+            selector_info: sel("second-field", "#second-field"),
+            tag: "INPUT".to_owned(),
+            value: "unmatched".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        assert_eq!(core.bound_columns()[0], Some(0)); // step 0 bound to col 0
+        assert_eq!(core.bound_columns()[1], None); // col 1 unbound
+
+        // HandleNewField for column 1 should bind to step 1 (not step 0).
+        core.process(Command::HandleNewField { column: 1 });
+
+        let events = drain_events(&mut rx);
+        assert!(
+            has_event(&events, |e| matches!(
+                e,
+                TrainingEvent::ColumnBound {
+                    column: 1,
+                    step_index: 1
+                }
+            )),
+            "expected binding to step 1, not step 0",
+        );
+        assert_eq!(core.bound_columns()[1], Some(1));
+    }
+
+    #[test]
+    fn handle_new_field_out_of_range_emits_error() {
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Record a Type step.
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "unmatched".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // Column 99 is out of range (only 1 column exists).
+        core.process(Command::HandleNewField { column: 99 });
+
+        let events = drain_events(&mut rx);
+        assert!(
+            has_event(&events, |e| matches!(e, TrainingEvent::Error(_))),
+            "expected an Error event",
+        );
+        // Bindings should be unmodified.
+        assert_eq!(core.bound_columns()[0], None);
+    }
+
+    // -- HandleEmptyCell tests --
+
+    #[test]
+    fn handle_empty_cell_stores_rule() {
+        let ds = test_data("name\tage\nAlice\t30\n");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::HandleEmptyCell {
+            column: 0,
+            rule: EmptyCellRule::Skip,
+        });
+        core.process(Command::HandleEmptyCell {
+            column: 1,
+            rule: EmptyCellRule::Default {
+                value: "N/A".to_owned(),
+            },
+        });
+
+        assert_eq!(core.empty_cell_rules().get(&0), Some(&EmptyCellRule::Skip));
+        assert_eq!(
+            core.empty_cell_rules().get(&1),
+            Some(&EmptyCellRule::Default {
+                value: "N/A".to_owned()
+            }),
+        );
+    }
+
+    // -- build_workflow tests --
+
+    #[test]
+    fn build_workflow_captures_state() {
+        let ds = test_data("name\tage\nAlice\t30\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        let wf = core.build_workflow(None);
+        assert_eq!(wf.column_count, 2);
+        assert_eq!(wf.steps.len(), 1);
+        assert_eq!(wf.column_bindings[0], Some(0));
+        assert_eq!(wf.column_bindings[1], None);
     }
 }

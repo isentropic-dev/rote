@@ -50,15 +50,26 @@ impl SelectorInfo {
 
     /// Check if two `SelectorInfo`s refer to the same DOM element.
     ///
-    /// Matches if they share a non-empty id, or if their CSS selectors match.
+    /// Matches if they share a non-empty id, CSS selector, or `XPath` expression.
     fn same_element(&self, other: &Self) -> bool {
         if let (Some(a), Some(b)) = (&self.id, &other.id)
-            && !a.is_empty() && !b.is_empty() && a == b
+            && !a.is_empty()
+            && !b.is_empty()
+            && a == b
         {
             return true;
         }
         if let (Some(a), Some(b)) = (&self.css, &other.css)
-            && !a.is_empty() && !b.is_empty() && a == b
+            && !a.is_empty()
+            && !b.is_empty()
+            && a == b
+        {
+            return true;
+        }
+        if let (Some(a), Some(b)) = (&self.xpath, &other.xpath)
+            && !a.is_empty()
+            && !b.is_empty()
+            && a == b
         {
             return true;
         }
@@ -90,10 +101,7 @@ pub enum Command {
     /// Change the playback speed.
     SetSpeed(PlaybackSpeed),
     /// Set the rule for handling empty cells in a column.
-    HandleEmptyCell {
-        column: usize,
-        rule: EmptyCellRule,
-    },
+    HandleEmptyCell { column: usize, rule: EmptyCellRule },
     /// Assign an unbound column to the most recent input step.
     HandleNewField { column: usize },
 }

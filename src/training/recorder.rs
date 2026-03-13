@@ -223,10 +223,7 @@ mod tests {
                 assert_eq!(tag, "BUTTON");
                 assert_eq!(selector_info.id.as_deref(), Some("submit-btn"));
                 assert_eq!(selector_info.css.as_deref(), Some("#submit-btn"));
-                assert_eq!(
-                    selector_info.text_content.as_deref(),
-                    Some("Submit")
-                );
+                assert_eq!(selector_info.text_content.as_deref(), Some("Submit"));
             }
             _ => panic!("expected BrowserClick"),
         }
