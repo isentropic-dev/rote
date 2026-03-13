@@ -18,7 +18,7 @@
 
 mod discover;
 mod launch;
-pub mod protocol;
+pub(crate) mod protocol;
 mod transport;
 
 pub use discover::{BrowserBinary, BrowserKind, find_browser, find_browsers};
@@ -64,9 +64,12 @@ pub enum CdpError {
 /// Manages the full lifecycle: discovery → launch → WebSocket connect → domain enablement.
 /// On drop, the browser process is killed and the temporary profile directory is cleaned up.
 pub struct Browser {
+    // Field order matters: Rust drops fields in declaration order.
+    // Transport must drop first (aborting WebSocket tasks) before
+    // the process is killed.
+    transport: Transport,
     #[allow(dead_code)] // Held for its Drop impl, which kills the browser.
     process: launch::BrowserProcess,
-    transport: Transport,
 }
 
 impl Browser {
@@ -96,7 +99,7 @@ impl Browser {
         let transport = Transport::connect(&ws_url).await?;
 
         // Enable core domains.
-        let mut browser = Self { process, transport };
+        let mut browser = Self { transport, process };
         browser.enable_domains().await?;
 
         Ok(browser)

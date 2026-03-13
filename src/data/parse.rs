@@ -27,8 +27,8 @@ impl DataSet {
     }
 
     /// Get a data row by index.
-    pub fn row(&self, index: usize) -> Option<&Vec<String>> {
-        self.rows.get(index)
+    pub fn row(&self, index: usize) -> Option<&[String]> {
+        self.rows.get(index).map(Vec::as_slice)
     }
 
     /// Iterator over all data rows.

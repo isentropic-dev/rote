@@ -22,14 +22,14 @@ pub struct RawMessage {
     /// Present on successful responses.
     pub result: Option<Value>,
     /// Present on error responses.
-    pub error: Option<CdpError>,
+    pub error: Option<WireError>,
     /// Present on events.
     pub params: Option<Value>,
 }
 
-/// A CDP error object from a failed command.
+/// A CDP error object from a failed command (wire-level).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CdpError {
+pub struct WireError {
     pub code: i64,
     pub message: String,
     pub data: Option<String>,
@@ -46,7 +46,7 @@ pub enum Message {
 #[derive(Debug)]
 pub struct Response {
     pub id: u64,
-    pub result: Result<Value, CdpError>,
+    pub result: Result<Value, WireError>,
 }
 
 /// A CDP event pushed by the browser.
@@ -111,8 +111,10 @@ pub struct TabInfo {
 /// The CDP domains we enable on connection.
 pub const ENABLED_DOMAINS: &[&str] = &["Runtime", "Page", "DOM"];
 
-/// Build a domain enable command.
-pub fn enable_command(id: u64, domain: &str) -> Command {
+// Test-only helpers for building CDP commands.
+
+#[cfg(test)]
+fn enable_command(id: u64, domain: &str) -> Command {
     Command {
         id,
         method: format!("{domain}.enable"),
@@ -120,8 +122,8 @@ pub fn enable_command(id: u64, domain: &str) -> Command {
     }
 }
 
-/// Build a `Runtime.evaluate` command.
-pub fn runtime_evaluate(id: u64, expression: &str) -> Command {
+#[cfg(test)]
+fn runtime_evaluate(id: u64, expression: &str) -> Command {
     Command {
         id,
         method: "Runtime.evaluate".into(),
@@ -132,25 +134,9 @@ pub fn runtime_evaluate(id: u64, expression: &str) -> Command {
     }
 }
 
-/// Known CDP event method name prefixes for filtering.
-pub fn domain_for_method(method: &str) -> Option<&str> {
+#[cfg(test)]
+fn domain_for_method(method: &str) -> Option<&str> {
     method.split('.').next()
-}
-
-/// Helper to build a command with JSON params.
-pub fn command(id: u64, method: impl Into<String>, params: Option<Value>) -> Command {
-    Command {
-        id,
-        method: method.into(),
-        params,
-    }
-}
-
-/// Helper to build params from key-value pairs.
-pub fn params(entries: impl IntoIterator<Item = (impl Into<String>, Value)>) -> Value {
-    let map: serde_json::Map<String, Value> =
-        entries.into_iter().map(|(k, v)| (k.into(), v)).collect();
-    Value::Object(map)
 }
 
 #[cfg(test)]

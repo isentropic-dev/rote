@@ -83,11 +83,8 @@ mod tests {
         assert_eq!(ds.headers().unwrap(), &["name", "age", "city"]);
         assert_eq!(ds.row_count(), 2);
         assert_eq!(ds.column_count(), 3);
-        let expected: Vec<String> = ["Alice", "30", "Portland"]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert_eq!(ds.row(0), Some(&expected));
+        let expected: &[&str] = &["Alice", "30", "Portland"];
+        assert_eq!(ds.row(0).unwrap(), expected);
     }
 
     #[test]

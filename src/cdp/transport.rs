@@ -20,7 +20,7 @@ use protocol::{Command, Event, Message, RawMessage};
 use futures_util::{SinkExt, StreamExt};
 
 /// Pending response senders, keyed by command ID.
-type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, protocol::CdpError>>>;
+type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, protocol::WireError>>>;
 
 /// Channel capacity for the event broadcast channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -35,7 +35,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// and broadcasting events to subscribers.
 pub struct Transport {
     /// Sends commands to the writer task.
-    command_tx: mpsc::Sender<(Command, oneshot::Sender<Result<Value, protocol::CdpError>>)>,
+    command_tx: mpsc::Sender<(Command, oneshot::Sender<Result<Value, protocol::WireError>>)>,
     /// Broadcasts events to subscribers.
     event_tx: broadcast::Sender<Event>,
     /// Next command ID.
@@ -119,12 +119,6 @@ impl Transport {
         self.event_tx.subscribe()
     }
 
-    /// Shut down the transport, aborting background tasks.
-    pub fn shutdown(self) {
-        self.reader_handle.abort();
-        self.writer_handle.abort();
-    }
-
     /// Background task: reads WebSocket messages, routes responses and events.
     async fn reader_loop<S>(
         mut ws_read: S,
@@ -166,7 +160,7 @@ impl Transport {
         mut ws_write: S,
         mut command_rx: mpsc::Receiver<(
             Command,
-            oneshot::Sender<Result<Value, protocol::CdpError>>,
+            oneshot::Sender<Result<Value, protocol::WireError>>,
         )>,
         pending: Arc<tokio::sync::Mutex<PendingMap>>,
     ) where
@@ -175,7 +169,7 @@ impl Transport {
         while let Some((cmd, response_tx)) = command_rx.recv().await {
             let id = cmd.id;
             let Ok(json) = serde_json::to_string(&cmd) else {
-                let _ = response_tx.send(Err(protocol::CdpError {
+                let _ = response_tx.send(Err(protocol::WireError {
                     code: -1,
                     message: "failed to serialize command".into(),
                     data: None,
@@ -194,5 +188,12 @@ impl Transport {
                 break;
             }
         }
+    }
+}
+
+impl Drop for Transport {
+    fn drop(&mut self) {
+        self.reader_handle.abort();
+        self.writer_handle.abort();
     }
 }
