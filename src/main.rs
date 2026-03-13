@@ -45,18 +45,6 @@ fn main() {
     let outcome = rt.block_on(tui::run(dataset));
 
     match outcome {
-        Ok(tui::Outcome::Continue(ds)) => {
-            println!(
-                "Loaded {} rows × {} columns.",
-                ds.row_count(),
-                ds.column_count(),
-            );
-            if let Some(headers) = ds.headers() {
-                println!("Headers: {}", headers.join(", "));
-            }
-            println!();
-            println!("Next: browser launch (not yet implemented).");
-        }
         Ok(tui::Outcome::Quit) => {
             println!("Goodbye.");
         }

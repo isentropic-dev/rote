@@ -2,9 +2,7 @@
 
 use std::{fs, path::PathBuf, process, time::Duration};
 
-use tokio::{net::TcpStream, time};
-// Trait imports: needed for `.read_to_string()` and `.write_all()` on async streams.
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time;
 
 use super::{CdpError, discover, protocol};
 use discover::BrowserBinary;
@@ -152,43 +150,22 @@ async fn fetch_tabs(port: u16) -> Result<Vec<TabInfo>, CdpError> {
         .map_err(|e| CdpError::Protocol(format!("failed to parse /json/list: {e}")))
 }
 
-/// Minimal HTTP GET using a raw TCP connection.
+/// HTTP GET for the browser's local JSON endpoints.
 ///
-/// We avoid pulling in a full HTTP client (reqwest/hyper) for these
-/// two simple JSON endpoints.
-/// The debug endpoint always returns the full body in one response.
+/// Uses `ureq` instead of a hand-rolled localhost client because Chrome's
+/// debug endpoint can behave poorly with the minimal implementation.
 async fn http_get(url: &str) -> Result<String, CdpError> {
-    // Parse the URL minimally — we only ever hit localhost.
-    let url = url
-        .strip_prefix("http://")
-        .ok_or_else(|| CdpError::Protocol(format!("invalid URL: {url}")))?;
+    let url = url.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut response = ureq::get(&url)
+            .call()
+            .map_err(|e| CdpError::Connection(format!("failed to GET {url}: {e}")))?;
 
-    let (host_port, path) = url
-        .split_once('/')
-        .map(|(hp, p)| (hp, format!("/{p}")))
-        .unwrap_or((url, "/".into()));
-
-    let mut stream = TcpStream::connect(host_port)
-        .await
-        .map_err(|e| CdpError::Connection(format!("failed to connect to {host_port}: {e}")))?;
-
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|e| CdpError::Connection(format!("failed to write HTTP request: {e}")))?;
-
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .await
-        .map_err(|e| CdpError::Connection(format!("failed to read HTTP response: {e}")))?;
-
-    // Split headers from body.
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_owned())
-        .unwrap_or(response);
-
-    Ok(body)
+        response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| CdpError::Connection(format!("failed to read HTTP response body: {e}")))
+    })
+    .await
+    .map_err(|e| CdpError::Connection(format!("HTTP worker task failed: {e}")))?
 }
