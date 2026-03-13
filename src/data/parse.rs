@@ -35,6 +35,17 @@ impl DataSet {
     pub fn rows(&self) -> &[Vec<String>] {
         &self.rows
     }
+
+    /// Promote the first data row to column headers.
+    ///
+    /// Returns `self` unchanged if headers are already set or there are no rows.
+    #[must_use]
+    pub fn with_first_row_as_headers(mut self) -> Self {
+        if self.headers.is_none() && !self.rows.is_empty() {
+            self.headers = Some(self.rows.remove(0));
+        }
+        self
+    }
 }
 
 /// Parse delimited text into a `DataSet`.
