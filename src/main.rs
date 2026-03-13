@@ -1,6 +1,7 @@
 mod cdp;
 mod cli;
 mod data;
+mod playback;
 mod training;
 mod tui;
 mod workflow;

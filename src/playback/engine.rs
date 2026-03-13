@@ -1,0 +1,758 @@
+// Playback engine: orchestrates row iteration, step execution, and control flow.
+
+use std::collections::HashMap;
+use std::future::Future;
+
+use tokio::sync::mpsc;
+
+use crate::cdp::Browser;
+use crate::data::DataSet;
+use crate::workflow::{EmptyCellRule, PlaybackSpeed, Step, Workflow};
+
+use super::execute::{self, StepOutcome};
+use super::{ErrorAction, PlaybackControl, PlaybackError, PlaybackEvent};
+
+// ─── Pure gate-decision helpers ───────────────────────────────────────────
+
+/// Whether the engine should pause for confirmation after `step` at `speed`.
+#[must_use]
+pub(crate) fn needs_step_gate(speed: PlaybackSpeed, step: &Step) -> bool {
+    match speed {
+        PlaybackSpeed::Manual => true,
+        PlaybackSpeed::Cell => matches!(step, Step::Type { .. }),
+        PlaybackSpeed::Row | PlaybackSpeed::Auto => false,
+    }
+}
+
+/// Whether the engine should pause for confirmation after finishing a row.
+#[must_use]
+pub(crate) fn needs_row_gate(speed: PlaybackSpeed) -> bool {
+    speed == PlaybackSpeed::Row
+}
+
+// ─── Internal executor abstraction ───────────────────────────────────────
+
+/// Abstracts step execution so the engine loop can be tested without a browser.
+pub(crate) trait Executor {
+    /// Execute `step` against `row` with the given empty-cell rules.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined; see [`execute_step`](super::execute::execute_step).
+    fn run_step(
+        &self,
+        step: &Step,
+        row: &[String],
+        rules: &HashMap<usize, EmptyCellRule>,
+    ) -> impl Future<Output = Result<StepOutcome, PlaybackError>>;
+}
+
+/// Production executor that drives a real browser via CDP.
+pub(crate) struct BrowserExecutor<'b> {
+    browser: &'b Browser,
+}
+
+impl<'b> BrowserExecutor<'b> {
+    pub(crate) fn new(browser: &'b Browser) -> Self {
+        Self { browser }
+    }
+}
+
+impl Executor for BrowserExecutor<'_> {
+    async fn run_step(
+        &self,
+        step: &Step,
+        row: &[String],
+        rules: &HashMap<usize, EmptyCellRule>,
+    ) -> Result<StepOutcome, PlaybackError> {
+        execute::execute_step(self.browser, step, row, rules).await
+    }
+}
+
+// ─── Row outcome ─────────────────────────────────────────────────────────
+
+/// Internal result of processing a single row.
+enum RowOutcome {
+    /// All steps succeeded; advance to the next row.
+    Completed,
+    /// Row was skipped (error + `SkipRow`).
+    Skipped,
+    /// Row should be retried from step 0.
+    Retry,
+    /// User requested a full stop.
+    Stop,
+}
+
+// ─── Public result type ───────────────────────────────────────────────────
+
+/// Summary of a completed playback run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackResult {
+    /// Rows that completed every step successfully.
+    pub rows_completed: usize,
+    /// Rows that were skipped (error + `SkipRow` action).
+    pub rows_skipped: usize,
+}
+
+// ─── Engine ───────────────────────────────────────────────────────────────
+
+/// Orchestrates playback of a [`Workflow`] against a [`DataSet`].
+///
+/// Communicate with the engine at runtime via the channels returned by [`PlaybackEngine::new`].
+#[allow(clippy::module_name_repetitions)]
+pub struct PlaybackEngine {
+    workflow: Workflow,
+    data: DataSet,
+    /// Row to start (or resume) from.
+    current_row: usize,
+    speed: PlaybackSpeed,
+    /// Receives control signals from the TUI / CLI.
+    control_rx: mpsc::UnboundedReceiver<PlaybackControl>,
+    /// Sends progress events to the TUI / CLI.
+    event_tx: mpsc::UnboundedSender<PlaybackEvent>,
+}
+
+impl PlaybackEngine {
+    /// Create a new engine and return the associated control/event channels.
+    ///
+    /// - `control_tx` — send [`PlaybackControl`] messages to drive the engine.
+    /// - `event_rx` — receive [`PlaybackEvent`] messages from the engine.
+    #[must_use]
+    pub fn new(
+        workflow: Workflow,
+        data: DataSet,
+        speed: PlaybackSpeed,
+        start_row: usize,
+    ) -> (
+        Self,
+        mpsc::UnboundedSender<PlaybackControl>,
+        mpsc::UnboundedReceiver<PlaybackEvent>,
+    ) {
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+        let engine = Self {
+            workflow,
+            data,
+            current_row: start_row,
+            speed,
+            control_rx,
+            event_tx,
+        };
+
+        (engine, control_tx, event_rx)
+    }
+
+    /// Run the playback loop from [`Self::current_row`] to the last data row.
+    ///
+    /// Each row emits [`PlaybackEvent::RowStarted`] / [`PlaybackEvent::RowCompleted`].
+    /// Each step emits [`PlaybackEvent::StepStarted`] / [`PlaybackEvent::StepCompleted`]
+    /// (or [`PlaybackEvent::StepFailed`] on error).
+    /// When all rows are done (or the user stops) a [`PlaybackEvent::Finished`] event is sent.
+    ///
+    /// # Errors
+    ///
+    /// - [`PlaybackError::Stopped`] — user sent [`ErrorAction::Stop`] or the control channel closed.
+    /// - [`PlaybackError::Cdp`] — an unrecoverable CDP error occurred.
+    pub async fn run(&mut self, browser: &Browser) -> Result<PlaybackResult, PlaybackError> {
+        self.run_with(BrowserExecutor::new(browser)).await
+    }
+
+    /// Internal implementation, generic over the step executor.
+    async fn run_with<E: Executor>(&mut self, executor: E) -> Result<PlaybackResult, PlaybackError> {
+        let mut rows_completed = 0usize;
+        let mut rows_skipped = 0usize;
+        let row_count = self.data.row_count();
+        let mut row_index = self.current_row;
+
+        while row_index < row_count {
+            let _ = self.event_tx.send(PlaybackEvent::RowStarted { row_index });
+
+            // Clone the row so we can hold `&mut self` for gate/control ops.
+            let row = self
+                .data
+                .row(row_index)
+                .map(<[String]>::to_vec)
+                .ok_or_else(|| {
+                    PlaybackError::Other(format!("row {row_index} out of bounds"))
+                })?;
+
+            match self.run_row(&executor, row_index, &row).await? {
+                RowOutcome::Completed => {
+                    let _ = self.event_tx.send(PlaybackEvent::RowCompleted { row_index });
+                    rows_completed += 1;
+                    row_index += 1;
+                }
+                RowOutcome::Skipped => {
+                    rows_skipped += 1;
+                    row_index += 1;
+                }
+                RowOutcome::Retry => {
+                    // row_index unchanged — will re-execute the same row.
+                }
+                RowOutcome::Stop => {
+                    let _ = self.event_tx.send(PlaybackEvent::Finished {
+                        rows_completed,
+                        rows_skipped,
+                    });
+                    return Err(PlaybackError::Stopped);
+                }
+            }
+        }
+
+        let _ = self.event_tx.send(PlaybackEvent::Finished {
+            rows_completed,
+            rows_skipped,
+        });
+
+        Ok(PlaybackResult {
+            rows_completed,
+            rows_skipped,
+        })
+    }
+
+    /// Execute all steps for one row, returning the row-level outcome.
+    async fn run_row<E: Executor>(
+        &mut self,
+        executor: &E,
+        row_index: usize,
+        row: &[String],
+    ) -> Result<RowOutcome, PlaybackError> {
+        let step_count = self.workflow.steps.len();
+
+        for step_index in 0..step_count {
+            // Clone the step to free the borrow on `self.workflow` before we
+            // need `&mut self` for gate/control operations.
+            let step = self.workflow.steps[step_index].clone();
+
+            let _ = self
+                .event_tx
+                .send(PlaybackEvent::StepStarted { row_index, step_index });
+
+            let result = executor
+                .run_step(&step, row, &self.workflow.empty_cell_rules)
+                .await;
+
+            match result {
+                Ok(StepOutcome::Skipped) => {
+                    let _ = self
+                        .event_tx
+                        .send(PlaybackEvent::StepCompleted { row_index, step_index });
+                }
+
+                Ok(StepOutcome::Executed) => {
+                    let _ = self
+                        .event_tx
+                        .send(PlaybackEvent::StepCompleted { row_index, step_index });
+
+                    if needs_step_gate(self.speed, &step) {
+                        self.wait_for_confirmation().await?;
+                    }
+                }
+
+                Err(e) => {
+                    let _ = self.event_tx.send(PlaybackEvent::StepFailed {
+                        row_index,
+                        step_index,
+                        error: e.to_string(),
+                    });
+
+                    match self.wait_for_error_action().await? {
+                        ErrorAction::SkipRow => return Ok(RowOutcome::Skipped),
+                        ErrorAction::RetryRow => return Ok(RowOutcome::Retry),
+                        ErrorAction::Stop => return Ok(RowOutcome::Stop),
+                    }
+                }
+            }
+        }
+
+        // Row-level gate: pause after all steps if speed is `Row`.
+        if needs_row_gate(self.speed) {
+            self.wait_for_confirmation().await?;
+        }
+
+        Ok(RowOutcome::Completed)
+    }
+
+    /// Block at a confirmation gate until [`PlaybackControl::Proceed`] is received.
+    ///
+    /// While waiting, [`PlaybackControl::SetSpeed`] and [`PlaybackControl::Pause`]
+    /// are handled transparently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlaybackError::Stopped`] if the control channel closes.
+    async fn wait_for_confirmation(&mut self) -> Result<(), PlaybackError> {
+        let _ = self.event_tx.send(PlaybackEvent::WaitingForConfirmation);
+
+        loop {
+            match self.control_rx.recv().await {
+                Some(PlaybackControl::Proceed) => return Ok(()),
+
+                Some(PlaybackControl::SetSpeed(speed)) => {
+                    self.speed = speed;
+                    let _ = self.event_tx.send(PlaybackEvent::SpeedChanged(speed));
+                }
+
+                Some(PlaybackControl::Pause) => {
+                    self.speed = PlaybackSpeed::Manual;
+                    let _ = self
+                        .event_tx
+                        .send(PlaybackEvent::SpeedChanged(PlaybackSpeed::Manual));
+                    // Still waiting for Proceed.
+                }
+
+                // Ignore error responses while at a confirmation gate.
+                Some(PlaybackControl::ErrorResponse(_)) => {}
+
+                // Channel closed — treat as Stop.
+                None => return Err(PlaybackError::Stopped),
+            }
+        }
+    }
+
+    /// Block until a [`PlaybackControl::ErrorResponse`] is received.
+    ///
+    /// While waiting, [`PlaybackControl::SetSpeed`] and [`PlaybackControl::Pause`]
+    /// are handled transparently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlaybackError::Stopped`] if the control channel closes.
+    async fn wait_for_error_action(&mut self) -> Result<ErrorAction, PlaybackError> {
+        loop {
+            match self.control_rx.recv().await {
+                Some(PlaybackControl::ErrorResponse(action)) => return Ok(action),
+
+                Some(PlaybackControl::SetSpeed(speed)) => {
+                    self.speed = speed;
+                    let _ = self.event_tx.send(PlaybackEvent::SpeedChanged(speed));
+                }
+
+                Some(PlaybackControl::Pause) => {
+                    self.speed = PlaybackSpeed::Manual;
+                    let _ = self
+                        .event_tx
+                        .send(PlaybackEvent::SpeedChanged(PlaybackSpeed::Manual));
+                }
+
+                // Ignore Proceed while in error state.
+                Some(PlaybackControl::Proceed) => {}
+
+                // Channel closed — treat as Stop.
+                None => return Err(PlaybackError::Stopped),
+            }
+        }
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::workflow::{PlaybackSpeed, Selector, Step, ValueSource, Workflow};
+
+    // ── Mock executor ─────────────────────────────────────────────────────
+
+    /// Always returns `Executed` — used when we don't care about step results.
+    struct OkExecutor;
+
+    impl Executor for OkExecutor {
+        async fn run_step(
+            &self,
+            _step: &Step,
+            _row: &[String],
+            _rules: &HashMap<usize, EmptyCellRule>,
+        ) -> Result<StepOutcome, PlaybackError> {
+            Ok(StepOutcome::Executed)
+        }
+    }
+
+    /// Always returns the error stored inside.
+    struct ErrExecutor(String);
+
+    impl Executor for ErrExecutor {
+        async fn run_step(
+            &self,
+            _step: &Step,
+            _row: &[String],
+            _rules: &HashMap<usize, EmptyCellRule>,
+        ) -> Result<StepOutcome, PlaybackError> {
+            Err(PlaybackError::Other(self.0.clone()))
+        }
+    }
+
+    // ── Step constructors ─────────────────────────────────────────────────
+
+    fn click_step() -> Step {
+        Step::Click {
+            selector: Selector {
+                strategies: vec![],
+                tag: "BUTTON".to_owned(),
+            },
+        }
+    }
+
+    fn type_step() -> Step {
+        Step::Type {
+            selector: Selector {
+                strategies: vec![],
+                tag: "INPUT".to_owned(),
+            },
+            source: ValueSource::Literal {
+                value: "x".to_owned(),
+            },
+        }
+    }
+
+    fn navigate_step() -> Step {
+        Step::Navigate {
+            url: "https://example.com".to_owned(),
+        }
+    }
+
+    // ── Gate-decision pure tests ──────────────────────────────────────────
+
+    #[test]
+    fn manual_gates_every_step() {
+        for step in &[click_step(), type_step(), navigate_step()] {
+            assert!(needs_step_gate(PlaybackSpeed::Manual, step));
+        }
+    }
+
+    #[test]
+    fn cell_gates_only_type_steps() {
+        assert!(!needs_step_gate(PlaybackSpeed::Cell, &click_step()));
+        assert!(needs_step_gate(PlaybackSpeed::Cell, &type_step()));
+        assert!(!needs_step_gate(PlaybackSpeed::Cell, &navigate_step()));
+    }
+
+    #[test]
+    fn row_and_auto_never_gate_steps() {
+        for speed in [PlaybackSpeed::Row, PlaybackSpeed::Auto] {
+            for step in &[click_step(), type_step(), navigate_step()] {
+                assert!(!needs_step_gate(speed, step));
+            }
+        }
+    }
+
+    #[test]
+    fn only_row_speed_gates_rows() {
+        assert!(needs_row_gate(PlaybackSpeed::Row));
+        assert!(!needs_row_gate(PlaybackSpeed::Manual));
+        assert!(!needs_row_gate(PlaybackSpeed::Cell));
+        assert!(!needs_row_gate(PlaybackSpeed::Auto));
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    fn dataset(rows: &[&str]) -> crate::data::DataSet {
+        let text = format!("col\n{}\n", rows.join("\n"));
+        crate::data::from_delimited_str(&text, crate::data::Delimiter::Tab, true)
+            .expect("test dataset")
+    }
+
+    fn empty_workflow() -> Workflow {
+        Workflow::new(1, vec![], vec![], HashMap::new(), None)
+    }
+
+    fn workflow_with_steps(steps: Vec<Step>) -> Workflow {
+        Workflow::new(1, steps, vec![], HashMap::new(), None)
+    }
+
+    /// Drain all available events from the receiver without blocking.
+    fn drain_events(rx: &mut mpsc::UnboundedReceiver<PlaybackEvent>) -> Vec<PlaybackEvent> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    // ── Row-iteration tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn empty_workflow_completes_all_rows() {
+        let (mut engine, _ctrl, mut event_rx) =
+            PlaybackEngine::new(empty_workflow(), dataset(&["Alice", "Bob"]), PlaybackSpeed::Auto, 0);
+
+        let result = engine.run_with(OkExecutor).await.unwrap();
+
+        assert_eq!(result.rows_completed, 2);
+        assert_eq!(result.rows_skipped, 0);
+
+        let events = drain_events(&mut event_rx);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                PlaybackEvent::RowStarted { .. } => "RowStarted",
+                PlaybackEvent::RowCompleted { .. } => "RowCompleted",
+                PlaybackEvent::Finished { .. } => "Finished",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            &["RowStarted", "RowCompleted", "RowStarted", "RowCompleted", "Finished"],
+        );
+    }
+
+    #[tokio::test]
+    async fn row_indices_are_correct() {
+        let (mut engine, _ctrl, mut event_rx) =
+            PlaybackEngine::new(empty_workflow(), dataset(&["Alice", "Bob"]), PlaybackSpeed::Auto, 0);
+
+        engine.run_with(OkExecutor).await.unwrap();
+
+        let started: Vec<usize> = drain_events(&mut event_rx)
+            .into_iter()
+            .filter_map(|e| {
+                if let PlaybackEvent::RowStarted { row_index } = e {
+                    Some(row_index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(started, &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn start_row_is_respected() {
+        let (mut engine, _ctrl, mut event_rx) =
+            PlaybackEngine::new(empty_workflow(), dataset(&["Alice", "Bob"]), PlaybackSpeed::Auto, 1);
+
+        let result = engine.run_with(OkExecutor).await.unwrap();
+        assert_eq!(result.rows_completed, 1);
+
+        let started: Vec<usize> = drain_events(&mut event_rx)
+            .into_iter()
+            .filter_map(|e| {
+                if let PlaybackEvent::RowStarted { row_index } = e {
+                    Some(row_index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(started, &[1]);
+    }
+
+    #[tokio::test]
+    async fn finished_event_carries_counts() {
+        let (mut engine, _ctrl, mut event_rx) =
+            PlaybackEngine::new(empty_workflow(), dataset(&["Alice", "Bob"]), PlaybackSpeed::Auto, 0);
+
+        engine.run_with(OkExecutor).await.unwrap();
+
+        let counts = drain_events(&mut event_rx).into_iter().find_map(|e| {
+            if let PlaybackEvent::Finished { rows_completed, rows_skipped } = e {
+                Some((rows_completed, rows_skipped))
+            } else {
+                None
+            }
+        });
+        assert_eq!(counts, Some((2, 0)));
+    }
+
+    // ── Step event tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn steps_emit_started_and_completed() {
+        let steps = vec![click_step(), type_step()];
+        let (mut engine, _ctrl, mut event_rx) =
+            PlaybackEngine::new(workflow_with_steps(steps), dataset(&["x"]), PlaybackSpeed::Auto, 0);
+
+        engine.run_with(OkExecutor).await.unwrap();
+
+        let events = drain_events(&mut event_rx);
+        let step_events: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                PlaybackEvent::StepStarted { .. } => Some("StepStarted"),
+                PlaybackEvent::StepCompleted { .. } => Some("StepCompleted"),
+                _ => None,
+            })
+            .collect();
+        // Two steps: each should have Started + Completed.
+        assert_eq!(step_events, &["StepStarted", "StepCompleted", "StepStarted", "StepCompleted"]);
+    }
+
+    // ── Confirmation gate tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn row_gate_fires_and_blocks() {
+        // One row, one step (click), Row speed → should wait after the row.
+        let steps = vec![click_step()];
+        let (mut engine, ctrl_tx, mut event_rx) =
+            PlaybackEngine::new(workflow_with_steps(steps), dataset(&["x"]), PlaybackSpeed::Row, 0);
+
+        let handle = tokio::spawn(async move {
+            engine.run_with(OkExecutor).await
+        });
+
+        // Give the engine time to reach the gate.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Verify it emitted WaitingForConfirmation.
+        let events = drain_events(&mut event_rx);
+        assert!(events.iter().any(|e| matches!(e, PlaybackEvent::WaitingForConfirmation)));
+
+        // Proceed.
+        ctrl_tx.send(PlaybackControl::Proceed).unwrap();
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn manual_gate_fires_after_every_step() {
+        let steps = vec![click_step(), type_step()];
+        let (mut engine, ctrl_tx, _event_rx) =
+            PlaybackEngine::new(workflow_with_steps(steps), dataset(&["x"]), PlaybackSpeed::Manual, 0);
+
+        let handle = tokio::spawn(async move {
+            engine.run_with(OkExecutor).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Two steps → two gates; send Proceed for each.
+        ctrl_tx.send(PlaybackControl::Proceed).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        ctrl_tx.send(PlaybackControl::Proceed).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_speed_during_gate_is_applied() {
+        // Row speed → gate fires after the row's steps.
+        let (mut engine, ctrl_tx, mut event_rx) =
+            PlaybackEngine::new(empty_workflow(), dataset(&["x"]), PlaybackSpeed::Row, 0);
+
+        let handle = tokio::spawn(async move {
+            let result = engine.run_with(OkExecutor).await;
+            (result, engine.speed)
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ctrl_tx.send(PlaybackControl::SetSpeed(PlaybackSpeed::Auto)).unwrap();
+        ctrl_tx.send(PlaybackControl::Proceed).unwrap();
+
+        let (result, final_speed) = handle.await.unwrap();
+        assert!(result.is_ok());
+        assert_eq!(final_speed, PlaybackSpeed::Auto);
+
+        let events = drain_events(&mut event_rx);
+        assert!(events.iter().any(|e| matches!(e, PlaybackEvent::SpeedChanged(PlaybackSpeed::Auto))));
+    }
+
+    #[tokio::test]
+    async fn channel_close_stops_engine_at_gate() {
+        let (mut engine, ctrl_tx, _event_rx) =
+            PlaybackEngine::new(empty_workflow(), dataset(&["x"]), PlaybackSpeed::Row, 0);
+
+        let handle = tokio::spawn(async move {
+            engine.run_with(OkExecutor).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(ctrl_tx);
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result, Err(PlaybackError::Stopped)));
+    }
+
+    // ── Error-handling tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn skip_row_advances_and_counts_skipped() {
+        let steps = vec![click_step()];
+        let (mut engine, ctrl_tx, mut event_rx) =
+            PlaybackEngine::new(workflow_with_steps(steps), dataset(&["x", "y"]), PlaybackSpeed::Auto, 0);
+
+        let handle = tokio::spawn(async move {
+            engine.run_with(ErrExecutor("boom".to_owned())).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Both rows fail; skip each.
+        ctrl_tx.send(PlaybackControl::ErrorResponse(ErrorAction::SkipRow)).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        ctrl_tx.send(PlaybackControl::ErrorResponse(ErrorAction::SkipRow)).unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.rows_completed, 0);
+        assert_eq!(result.rows_skipped, 2);
+
+        let events = drain_events(&mut event_rx);
+        let failed_count = events.iter().filter(|e| matches!(e, PlaybackEvent::StepFailed { .. })).count();
+        assert_eq!(failed_count, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_row_re_executes() {
+        // First error → Retry; second error → Skip.
+        // Use a counter to distinguish first/second call.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingExecutor(Arc<AtomicUsize>);
+
+        impl Executor for CountingExecutor {
+            async fn run_step(
+                &self,
+                _step: &Step,
+                _row: &[String],
+                _rules: &HashMap<usize, EmptyCellRule>,
+            ) -> Result<StepOutcome, PlaybackError> {
+                let n = self.0.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    Err(PlaybackError::Other("first attempt".to_owned()))
+                } else {
+                    Ok(StepOutcome::Executed)
+                }
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let steps = vec![click_step()];
+        let (mut engine, ctrl_tx, _event_rx) =
+            PlaybackEngine::new(workflow_with_steps(steps), dataset(&["x"]), PlaybackSpeed::Auto, 0);
+
+        let exec = CountingExecutor(Arc::clone(&counter));
+        let handle = tokio::spawn(async move {
+            engine.run_with(exec).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // First attempt fails → Retry.
+        ctrl_tx.send(PlaybackControl::ErrorResponse(ErrorAction::RetryRow)).unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.rows_completed, 1);
+        // Called twice: once for the original attempt, once for the retry.
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn stop_action_returns_stopped_error() {
+        let steps = vec![click_step()];
+        let (mut engine, ctrl_tx, _event_rx) =
+            PlaybackEngine::new(workflow_with_steps(steps), dataset(&["x"]), PlaybackSpeed::Auto, 0);
+
+        let handle = tokio::spawn(async move {
+            engine.run_with(ErrExecutor("fail".to_owned())).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ctrl_tx.send(PlaybackControl::ErrorResponse(ErrorAction::Stop)).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result, Err(PlaybackError::Stopped)));
+    }
+}
