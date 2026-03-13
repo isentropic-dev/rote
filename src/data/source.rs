@@ -37,11 +37,13 @@ pub enum DataSourceConfig {
 
 impl DataSourceConfig {
     /// Config for clipboard-sourced data.
+    #[cfg(test)]
     pub fn clipboard(has_headers: bool) -> Self {
         DataSourceConfig::Clipboard { has_headers }
     }
 
     /// Config for file-sourced data.
+    #[cfg(test)]
     pub fn file(path: impl Into<String>, delimiter: Delimiter, has_headers: bool) -> Self {
         DataSourceConfig::File {
             path: path.into(),

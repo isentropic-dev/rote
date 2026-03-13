@@ -21,7 +21,7 @@ mod launch;
 pub(crate) mod protocol;
 mod transport;
 
-pub use discover::{BrowserBinary, BrowserKind, find_browser, find_browsers};
+pub use discover::{BrowserBinary, find_browser};
 pub use launch::DEFAULT_PORT;
 pub use protocol::Event;
 pub use transport::Transport;

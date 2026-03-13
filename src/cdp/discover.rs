@@ -11,6 +11,7 @@ pub enum BrowserKind {
 
 impl BrowserKind {
     /// Human-readable name.
+    #[cfg(test)]
     pub fn name(self) -> &'static str {
         match self {
             BrowserKind::Chrome => "Google Chrome",
@@ -22,6 +23,7 @@ impl BrowserKind {
 /// A discovered browser installation.
 #[derive(Debug, Clone)]
 pub struct BrowserBinary {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub kind: BrowserKind,
     pub path: PathBuf,
 }
@@ -156,11 +158,7 @@ fn windows_candidates() -> Vec<BrowserBinary> {
     ]
 }
 
-/// Exposed for testing: the raw candidate list before filtering by existence.
-#[cfg(test)]
-pub fn all_candidate_paths() -> Vec<BrowserBinary> {
-    candidate_paths()
-}
+
 
 #[cfg(test)]
 mod tests {

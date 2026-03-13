@@ -99,10 +99,13 @@ pub enum Command {
     /// Advance to the next data row.
     AdvanceRow,
     /// Change the playback speed.
+    #[allow(dead_code)] // Wired in a future milestone.
     SetSpeed(PlaybackSpeed),
     /// Set the rule for handling empty cells in a column.
+    #[allow(dead_code)] // Wired in a future milestone.
     HandleEmptyCell { column: usize, rule: EmptyCellRule },
     /// Assign an unbound column to the most recent input step.
+    #[allow(dead_code)] // Wired in a future milestone.
     HandleNewField { column: usize },
 }
 
@@ -118,7 +121,7 @@ pub enum TrainingEvent {
     /// All required columns in the current row are bound.
     RowComplete { row_index: usize },
     /// Playback speed was changed.
-    SpeedChanged(PlaybackSpeed),
+    SpeedChanged(#[allow(dead_code)] PlaybackSpeed),
     /// A bound column has an empty cell in the current row.
     EmptyCellEncountered { column: usize, row_index: usize },
     /// An unbound column has a non-empty value in the current row.

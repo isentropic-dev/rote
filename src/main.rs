@@ -1,9 +1,11 @@
 mod cdp;
 mod cli;
 mod data;
+#[allow(dead_code, unused_imports)]
 mod playback;
 mod training;
 mod tui;
+#[allow(dead_code)]
 mod workflow;
 
 use clap::Parser;

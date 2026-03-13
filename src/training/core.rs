@@ -4,8 +4,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use tokio::sync::mpsc;
 
-use crate::data::{DataSet, DataSourceConfig};
-use crate::workflow::{EmptyCellRule, PlaybackSpeed, Step, ValueSource, Workflow};
+use crate::data::DataSet;
+#[cfg(test)]
+use crate::data::DataSourceConfig;
+use crate::workflow::{EmptyCellRule, PlaybackSpeed, Step, ValueSource};
+#[cfg(test)]
+use crate::workflow::Workflow;
 
 use super::{Command, SelectorInfo, TrainingEvent};
 
@@ -92,11 +96,13 @@ impl TrainingCore {
     }
 
     /// The recorded steps so far.
+    #[cfg(test)]
     pub fn steps(&self) -> &[Step] {
         &self.steps
     }
 
     /// Current playback speed.
+    #[cfg(test)]
     pub fn speed(&self) -> PlaybackSpeed {
         self.speed
     }
@@ -107,6 +113,7 @@ impl TrainingCore {
     }
 
     /// The current per-column empty-cell rules.
+    #[cfg(test)]
     pub fn empty_cell_rules(&self) -> &BTreeMap<usize, EmptyCellRule> {
         &self.empty_cell_rules
     }
@@ -128,6 +135,7 @@ impl TrainingCore {
     ///
     /// The optional `data_source` is embedded in the workflow so that playback
     /// can reload the data automatically.
+    #[cfg(test)]
     pub fn build_workflow(&self, data_source: Option<DataSourceConfig>) -> Workflow {
         Workflow::new(
             self.data.column_count(),

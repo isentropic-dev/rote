@@ -63,15 +63,7 @@ impl BrowserProcess {
         Ok(process)
     }
 
-    /// The debugging port.
-    pub fn port(&self) -> u16 {
-        self.port
-    }
 
-    /// Fetch the browser version info from the debug endpoint.
-    pub async fn version(&self) -> Result<BrowserVersion, CdpError> {
-        fetch_version(self.port).await
-    }
 
     /// List open tabs/targets.
     pub async fn tabs(&self) -> Result<Vec<TabInfo>, CdpError> {

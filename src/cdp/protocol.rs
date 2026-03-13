@@ -79,7 +79,10 @@ impl RawMessage {
 }
 
 /// Response from `http://host:port/json/version`.
+///
+/// Deserialized from JSON; fields are populated by serde.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct BrowserVersion {
     #[serde(rename = "Browser")]
     pub browser: String,
@@ -91,14 +94,18 @@ pub struct BrowserVersion {
 
 impl BrowserVersion {
     /// Get the WebSocket debugger URL.
+    #[cfg(test)]
     pub fn debugger_url(&self) -> Option<&str> {
         self.ws_debugger_url.as_deref()
     }
 }
 
 /// Response entry from `http://host:port/json/list` (tab list).
+///
+/// Deserialized from JSON; fields are populated by serde.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct TabInfo {
     pub id: String,
     #[serde(rename = "type")]
