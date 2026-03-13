@@ -22,6 +22,7 @@ pub enum Outcome {
 
 enum State {
     Launching,
+    Ready(Browser),
     Failed(String),
 }
 
@@ -38,31 +39,36 @@ pub async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     loop {
         terminal.draw(|frame| draw(frame, &state))?;
 
-        if matches!(state, State::Launching) {
-            tokio::select! {
-                browser = &mut launch => {
-                    match browser {
-                        Ok(browser) => return Ok(Outcome::Continue(browser)),
-                        Err(error) => {
-                            state = State::Failed(error);
+        match &mut state {
+            State::Launching => {
+                tokio::select! {
+                    browser = &mut launch => {
+                        match browser {
+                            Ok(browser) => {
+                                state = State::Ready(browser);
+                            }
+                            Err(error) => {
+                                state = State::Failed(error);
+                            }
+                        }
+                    }
+                    maybe_event = events.next() => {
+                        let Some(event_result) = maybe_event else {
+                            return Ok(Outcome::Quit);
+                        };
+                        if let Some(outcome) = handle_event(&event_result?, &mut state, &mut launch) {
+                            return Ok(outcome);
                         }
                     }
                 }
-                maybe_event = events.next() => {
-                    let Some(event_result) = maybe_event else {
-                        return Ok(Outcome::Quit);
-                    };
-                    if handle_event(&event_result?, &mut state, &mut launch) {
-                        return Ok(Outcome::Quit);
-                    }
-                }
             }
-        } else {
-            let Some(event_result) = events.next().await else {
-                return Ok(Outcome::Quit);
-            };
-            if handle_event(&event_result?, &mut state, &mut launch) {
-                return Ok(Outcome::Quit);
+            State::Ready(_) | State::Failed(_) => {
+                let Some(event_result) = events.next().await else {
+                    return Ok(Outcome::Quit);
+                };
+                if let Some(outcome) = handle_event(&event_result?, &mut state, &mut launch) {
+                    return Ok(outcome);
+                }
             }
         }
     }
@@ -74,25 +80,32 @@ fn launch_browser() -> LaunchFuture {
     Box::pin(async { Browser::launch().await.map_err(|error| error.to_string()) })
 }
 
-fn handle_event(event: &Event, state: &mut State, launch: &mut LaunchFuture) -> bool {
+fn handle_event(event: &Event, state: &mut State, launch: &mut LaunchFuture) -> Option<Outcome> {
     let Event::Key(key) = event else {
-        return false;
+        return None;
     };
 
     if key.code == KeyCode::Char('q')
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
     {
-        return true;
+        return Some(Outcome::Quit);
     }
 
-    if matches!(state, State::Failed(_))
-        && (key.code == KeyCode::Enter || key.code == KeyCode::Char('r'))
-    {
-        *state = State::Launching;
-        *launch = launch_browser();
+    match state {
+        State::Ready(_) if key.code == KeyCode::Enter => {
+            let ready_state = std::mem::replace(state, State::Launching);
+            if let State::Ready(browser) = ready_state {
+                return Some(Outcome::Continue(browser));
+            }
+        }
+        State::Failed(_) if key.code == KeyCode::Enter || key.code == KeyCode::Char('r') => {
+            *state = State::Launching;
+            *launch = launch_browser();
+        }
+        State::Launching | State::Ready(_) | State::Failed(_) => {}
     }
 
-    false
+    None
 }
 
 fn draw(frame: &mut Frame, state: &State) {
@@ -111,6 +124,17 @@ fn draw(frame: &mut Frame, state: &State) {
             Line::from(""),
             Line::from("A Chrome or Edge window should appear shortly."),
             Line::from(vec![
+                Span::styled("[q]", Style::default().fg(Color::Red)),
+                Span::raw(" Quit"),
+            ]),
+        ],
+        State::Ready(_) => vec![
+            Line::from("Browser launched."),
+            Line::from(""),
+            Line::from("Navigate to your form, then press Enter to start training."),
+            Line::from(vec![
+                Span::styled("[Enter]", Style::default().fg(Color::Green)),
+                Span::raw(" Start training   "),
                 Span::styled("[q]", Style::default().fg(Color::Red)),
                 Span::raw(" Quit"),
             ]),
