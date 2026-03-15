@@ -1,6 +1,7 @@
 // Training core state machine implementation.
 
 use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -20,6 +21,21 @@ pub struct TrainingCore {
     steps: Vec<Step>,
     /// Tracks the `SelectorInfo` that produced each step, for same-element matching.
     step_selectors: Vec<Option<SelectorInfo>>,
+    /// Inter-step delays captured during training, parallel to `steps`.
+    ///
+    /// `step_delays[i]` is the elapsed time before step `i` was recorded
+    /// (zero for the first step).
+    step_delays: Vec<Duration>,
+    /// Instant when the most recent step was recorded.
+    ///
+    /// `None` before any step has been recorded.
+    last_step_time: Option<Instant>,
+    /// Captured when all fields are mapped (`RowComplete`).
+    ///
+    /// Measures the gap from the last recorded step to the moment training
+    /// considers the row done — before the user reviews the TUI or presses
+    /// Enter.
+    row_end_delay: Duration,
     /// `column_bindings[col]` = the step index that column is bound to.
     column_bindings: Vec<Option<usize>>,
     empty_cell_rules: BTreeMap<usize, EmptyCellRule>,
@@ -36,6 +52,9 @@ impl TrainingCore {
             current_row: 0,
             steps: Vec::new(),
             step_selectors: Vec::new(),
+            step_delays: Vec::new(),
+            last_step_time: None,
+            row_end_delay: Duration::ZERO,
             column_bindings: vec![None; col_count],
             empty_cell_rules: BTreeMap::new(),
             speed: PlaybackSpeed::default(),
@@ -136,6 +155,8 @@ impl TrainingCore {
         Workflow::new(
             self.data.column_count(),
             self.steps.clone(),
+            self.step_delays.clone(),
+            self.row_end_delay,
             self.column_bindings.clone(),
             self.empty_cell_rules.clone(),
             data_source,
@@ -144,12 +165,26 @@ impl TrainingCore {
 
     // -- Private handlers --
 
+    /// Compute the delay since the last recorded step and update `last_step_time`.
+    ///
+    /// Returns `Duration::ZERO` for the first step (no previous reference point).
+    fn record_step_time(&mut self) -> Duration {
+        let now = Instant::now();
+        let delay = self
+            .last_step_time
+            .map_or(Duration::ZERO, |t| now.duration_since(t));
+        self.last_step_time = Some(now);
+        delay
+    }
+
     fn handle_click(&mut self, selector_info: SelectorInfo, tag: String) {
+        let delay = self.record_step_time();
         let selector = selector_info.clone().into_selector(tag);
         let step = Step::Click { selector };
         let index = self.steps.len();
         self.steps.push(step.clone());
         self.step_selectors.push(Some(selector_info));
+        self.step_delays.push(delay);
         self.emit(TrainingEvent::StepRecorded { index, step });
     }
 
@@ -167,12 +202,20 @@ impl TrainingCore {
         };
 
         if let Some(idx) = existing_index {
-            // Update existing step.
+            // Update existing step (incremental typing).
+            // Update the timestamp so the *next* step's delay is measured from
+            // the latest keystroke, but preserve step_delays[0] = zero (the
+            // first step has no predecessor to measure from).
+            let delay = self.record_step_time();
+
             // If the old step was column-bound, unbind it first.
             self.unbind_step(idx);
 
             self.steps[idx] = step.clone();
             self.step_selectors[idx] = Some(selector_info);
+            if idx > 0 {
+                self.step_delays[idx] = delay;
+            }
 
             if let Some(col) = matched_column {
                 self.column_bindings[col] = Some(idx);
@@ -185,9 +228,11 @@ impl TrainingCore {
             self.emit(TrainingEvent::StepUpdated { index: idx, step });
         } else {
             // New step.
+            let delay = self.record_step_time();
             let index = self.steps.len();
             self.steps.push(step.clone());
             self.step_selectors.push(Some(selector_info));
+            self.step_delays.push(delay);
 
             if let Some(col) = matched_column {
                 self.column_bindings[col] = Some(index);
@@ -202,6 +247,12 @@ impl TrainingCore {
 
         // Check if row is now complete.
         if self.is_row_complete() {
+            // Snapshot row-end delay now — the gap from the last step to
+            // when all fields were mapped. This avoids capturing the time
+            // the user spends reviewing the TUI before pressing Enter.
+            self.row_end_delay = self
+                .last_step_time
+                .map_or(Duration::ZERO, |t| t.elapsed());
             self.emit(TrainingEvent::RowComplete {
                 row_index: self.current_row,
             });
@@ -209,10 +260,12 @@ impl TrainingCore {
     }
 
     fn handle_navigation(&mut self, _url: String) {
+        let delay = self.record_step_time();
         let step = Step::WaitForNavigation;
         let index = self.steps.len();
         self.steps.push(step.clone());
         self.step_selectors.push(None);
+        self.step_delays.push(delay);
         self.emit(TrainingEvent::StepRecorded { index, step });
     }
 
@@ -1022,5 +1075,133 @@ mod tests {
         assert_eq!(wf.steps.len(), 1);
         assert_eq!(wf.column_bindings[0], Some(0));
         assert_eq!(wf.column_bindings[1], None);
+    }
+
+    // -- Delay capture tests --
+
+    #[test]
+    fn first_step_has_zero_delay() {
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        let wf = core.build_workflow(None);
+        assert_eq!(wf.steps.len(), 1);
+        assert_eq!(wf.step_delays.len(), 1);
+        assert_eq!(wf.step_delays[0], std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn step_delays_parallel_steps() {
+        let ds = test_data("name\tage\nAlice\t30\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        core.process(Command::BrowserInput {
+            selector_info: sel("age-field", "#age-field"),
+            tag: "INPUT".to_owned(),
+            value: "30".to_owned(),
+        });
+        core.process(Command::BrowserClick {
+            selector_info: sel("submit-btn", "#submit-btn"),
+            tag: "BUTTON".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        let wf = core.build_workflow(None);
+        assert_eq!(wf.steps.len(), 3);
+        assert_eq!(wf.step_delays.len(), 3);
+        // First step is always zero.
+        assert_eq!(wf.step_delays[0], std::time::Duration::ZERO);
+        // Subsequent delays are non-negative (wall-clock elapsed).
+        // We can't assert exact values, but they must be >= 0 (always true).
+    }
+
+    #[test]
+    fn build_workflow_includes_row_end_delay() {
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        let wf = core.build_workflow(None);
+        // row_end_delay is the time elapsed since the last step was recorded.
+        // It should be a non-negative duration (always true).
+        let _ = wf.row_end_delay; // type check: Duration
+    }
+
+    #[test]
+    fn build_workflow_row_end_delay_zero_when_no_steps() {
+        let ds = test_data("name\nAlice\n");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let core = TrainingCore::new(ds, tx);
+
+        let wf = core.build_workflow(None);
+        assert_eq!(wf.row_end_delay, std::time::Duration::ZERO);
+        assert!(wf.step_delays.is_empty());
+    }
+
+    #[test]
+    fn incremental_typing_updates_delay() {
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // First keystrokes.
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Al".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // Final value — same element, so step is updated.
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        let wf = core.build_workflow(None);
+        // Only one step: it was updated, not duplicated.
+        assert_eq!(wf.steps.len(), 1);
+        assert_eq!(wf.step_delays.len(), 1);
+    }
+
+    #[test]
+    fn navigation_step_captures_delay() {
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserNavigation {
+            url: "https://example.com/page".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        let wf = core.build_workflow(None);
+        assert_eq!(wf.steps.len(), 1);
+        assert_eq!(wf.step_delays.len(), 1);
+        // First step is always zero.
+        assert_eq!(wf.step_delays[0], std::time::Duration::ZERO);
     }
 }

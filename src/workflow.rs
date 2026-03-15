@@ -5,9 +5,48 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 use std::{fs, io};
 
 use serde::{Deserialize, Serialize};
+
+// ─── Duration serde helpers ───────────────────────────────────────────────────
+
+/// Serialize/deserialize a [`Duration`] as milliseconds (u64).
+mod serde_duration_millis {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        // Durations exceeding ~585M years would truncate, but that's not a
+        // realistic step delay.
+        #[allow(clippy::cast_possible_truncation)]
+        s.serialize_u64(d.as_millis() as u64)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        u64::deserialize(d).map(Duration::from_millis)
+    }
+}
+
+/// Serialize/deserialize a `Vec<Duration>` as a JSON array of millisecond integers.
+mod serde_duration_millis_vec {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[Duration], s: S) -> Result<S::Ok, S::Error> {
+        // Durations exceeding ~585M years would truncate, not a realistic step delay.
+        #[allow(clippy::cast_possible_truncation)]
+        s.collect_seq(v.iter().map(|d| d.as_millis() as u64))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Duration>, D::Error> {
+        Vec::<u64>::deserialize(d)
+            .map(|v| v.into_iter().map(Duration::from_millis).collect())
+    }
+}
 
 use crate::data::DataSourceConfig;
 
@@ -97,7 +136,7 @@ pub enum PlaybackSpeed {
 }
 
 /// Current workflow format version.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// A complete workflow: the artifact that bridges sessions.
 ///
@@ -112,6 +151,21 @@ pub struct Workflow {
     pub column_count: usize,
     /// The recorded sequence of actions.
     pub steps: Vec<Step>,
+    /// Per-step delay captured during training.
+    ///
+    /// `step_delays[i]` is the elapsed time before step `i` was recorded
+    /// (relative to the previous step, or zero for the first step).
+    /// During playback, the engine sleeps this duration after each step.
+    /// Always has exactly `steps.len()` entries.
+    /// Defaults allow v1 files to deserialize so `validate()` can report a
+    /// clean "unsupported workflow version" error instead of a serde field error.
+    #[serde(default, with = "serde_duration_millis_vec")]
+    pub step_delays: Vec<Duration>,
+    /// Delay from the last step to when the row was finalized during training.
+    ///
+    /// Used during playback to pace the transition between rows.
+    #[serde(default, with = "serde_duration_millis")]
+    pub row_end_delay: Duration,
     /// Per-column binding: `column_bindings[col]` is `Some(step_index)` when
     /// that column is bound to a [`Step::Type`] step. Always has exactly
     /// `column_count` entries; `None` means the column is not yet bound.
@@ -148,6 +202,12 @@ pub enum WorkflowError {
     #[error("column_bindings has {found} entries but column_count is {expected}")]
     ColumnBindingLengthMismatch { expected: usize, found: usize },
 
+    #[error("step_delays has {found} entries but steps has {expected}")]
+    StepDelayLengthMismatch { expected: usize, found: usize },
+
+    #[error("delay value {millis}ms exceeds maximum ({max}ms)")]
+    DelayTooLarge { millis: u64, max: u64 },
+
     #[error("column {column} is bound to step {step_index}, which is not a Type step")]
     BindingNotTypeStep { column: usize, step_index: usize },
 }
@@ -158,6 +218,8 @@ impl Workflow {
     pub fn new(
         column_count: usize,
         steps: Vec<Step>,
+        step_delays: Vec<Duration>,
+        row_end_delay: Duration,
         column_bindings: Vec<Option<usize>>,
         empty_cell_rules: BTreeMap<usize, EmptyCellRule>,
         data_source: Option<DataSourceConfig>,
@@ -166,6 +228,8 @@ impl Workflow {
             version: FORMAT_VERSION,
             column_count,
             steps,
+            step_delays,
+            row_end_delay,
             column_bindings,
             empty_cell_rules,
             data_source,
@@ -231,6 +295,32 @@ impl Workflow {
             return Err(WorkflowError::ColumnBindingLengthMismatch {
                 expected: self.column_count,
                 found: self.column_bindings.len(),
+            });
+        }
+
+        if self.step_delays.len() != self.steps.len() {
+            return Err(WorkflowError::StepDelayLengthMismatch {
+                expected: self.steps.len(),
+                found: self.step_delays.len(),
+            });
+        }
+
+        // Reject absurdly large delays (e.g. from crafted workflow files).
+        // 30s is generous — real training delays are sub-second.
+        let max_delay = Duration::from_secs(30);
+        let max_ms: u64 = 30_000;
+        for delay in &self.step_delays {
+            if *delay > max_delay {
+                return Err(WorkflowError::DelayTooLarge {
+                    millis: delay.as_millis().try_into().unwrap_or(u64::MAX),
+                    max: max_ms,
+                });
+            }
+        }
+        if self.row_end_delay > max_delay {
+            return Err(WorkflowError::DelayTooLarge {
+                millis: self.row_end_delay.as_millis().try_into().unwrap_or(u64::MAX),
+                max: max_ms,
             });
         }
 
@@ -396,6 +486,14 @@ mod tests {
                     },
                 },
             ],
+            vec![
+                Duration::ZERO,
+                Duration::from_millis(500),
+                Duration::from_millis(300),
+                Duration::from_millis(400),
+                Duration::from_millis(200),
+            ],
+            Duration::from_millis(150),
             vec![Some(2), Some(3), None],
             rules,
             Some(DataSourceConfig::file(
@@ -418,12 +516,20 @@ mod tests {
     fn workflow_has_version() {
         let workflow = sample_workflow();
         let json = workflow.to_json().unwrap();
-        assert!(json.contains(r#""version": 1"#));
+        assert!(json.contains(r#""version": 2"#));
     }
 
     #[test]
     fn workflow_omits_empty_optional_fields() {
-        let workflow = Workflow::new(1, vec![], vec![None], BTreeMap::new(), None);
+        let workflow = Workflow::new(
+            1,
+            vec![],
+            vec![],
+            Duration::ZERO,
+            vec![None],
+            BTreeMap::new(),
+            None,
+        );
         let json = workflow.to_json().unwrap();
         assert!(!json.contains("emptyCellRules"));
         assert!(!json.contains("dataSource"));
@@ -441,9 +547,11 @@ mod tests {
     #[test]
     fn workflow_invalid_binding() {
         let workflow = Workflow {
-            version: 1,
+            version: 2,
             column_count: 1,
             steps: vec![],
+            step_delays: vec![],
+            row_end_delay: Duration::ZERO,
             column_bindings: vec![Some(5)],
             empty_cell_rules: BTreeMap::new(),
             data_source: None,
@@ -458,9 +566,11 @@ mod tests {
         let mut rules = BTreeMap::new();
         rules.insert(10, EmptyCellRule::Clear);
         let workflow = Workflow {
-            version: 1,
+            version: 2,
             column_count: 2,
             steps: vec![],
+            step_delays: vec![],
+            row_end_delay: Duration::ZERO,
             column_bindings: vec![None, None],
             empty_cell_rules: rules,
             data_source: None,
@@ -496,6 +606,8 @@ mod tests {
         assert!(json.contains("  "));
         // Key fields should be camelCase.
         assert!(json.contains("columnCount"));
+        assert!(json.contains("stepDelays"));
+        assert!(json.contains("rowEndDelay"));
         assert!(json.contains("columnBindings"));
         assert!(json.contains("emptyCellRules"));
         assert!(json.contains("dataSource"));
@@ -504,9 +616,11 @@ mod tests {
     #[test]
     fn workflow_column_binding_length_mismatch() {
         let workflow = Workflow {
-            version: 1,
+            version: 2,
             column_count: 3,
             steps: vec![],
+            step_delays: vec![],
+            row_end_delay: Duration::ZERO,
             column_bindings: vec![None, None], // length 2, but column_count is 3
             empty_cell_rules: BTreeMap::new(),
             data_source: None,
@@ -521,15 +635,18 @@ mod tests {
 
     #[test]
     fn workflow_binding_not_type_step() {
+        let click = Step::Click {
+            selector: Selector {
+                strategies: vec![],
+                tag: "BUTTON".to_owned(),
+            },
+        };
         let workflow = Workflow {
-            version: 1,
+            version: 2,
             column_count: 1,
-            steps: vec![Step::Click {
-                selector: Selector {
-                    strategies: vec![],
-                    tag: "BUTTON".to_owned(),
-                },
-            }],
+            steps: vec![click],
+            step_delays: vec![Duration::ZERO],
+            row_end_delay: Duration::ZERO,
             column_bindings: vec![Some(0)], // bound to a Click step, not Type
             empty_cell_rules: BTreeMap::new(),
             data_source: None,
@@ -540,5 +657,37 @@ mod tests {
             err.to_string().contains("not a Type step"),
             "unexpected error: {err}",
         );
+    }
+
+    #[test]
+    fn workflow_delay_length_mismatch() {
+        let workflow = Workflow {
+            version: 2,
+            column_count: 0,
+            steps: vec![Step::WaitForNavigation],
+            step_delays: vec![], // length 0, but steps has 1
+            row_end_delay: Duration::ZERO,
+            column_bindings: vec![],
+            empty_cell_rules: BTreeMap::new(),
+            data_source: None,
+        };
+        let json = serde_json::to_string(&workflow).unwrap();
+        let err = Workflow::from_json(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("step_delays has 0 entries"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn workflow_delays_round_trip() {
+        let workflow = sample_workflow();
+        let json = workflow.to_json().unwrap();
+        // Delays should be serialized as millisecond integers.
+        assert!(json.contains("stepDelays"));
+        assert!(json.contains("rowEndDelay"));
+        let back = Workflow::from_json(&json).unwrap();
+        assert_eq!(back.step_delays, workflow.step_delays);
+        assert_eq!(back.row_end_delay, workflow.row_end_delay);
     }
 }

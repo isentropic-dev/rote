@@ -77,10 +77,6 @@ pub struct PlaybackConfig {
     pub element_timeout: Duration,
     /// How long to wait for a `Page.frameNavigated` event after a triggering step.
     pub navigation_timeout: Duration,
-    /// Delay after each step in auto-advance modes (no confirmation gate).
-    /// Gives the browser time to settle and makes playback visible.
-    /// Future speed presets or recorded-timing playback can override this.
-    pub step_delay: Duration,
 }
 
 impl Default for PlaybackConfig {
@@ -88,7 +84,6 @@ impl Default for PlaybackConfig {
         Self {
             element_timeout: Duration::from_secs(5),
             navigation_timeout: Duration::from_secs(30),
-            step_delay: Duration::from_millis(200),
         }
     }
 }

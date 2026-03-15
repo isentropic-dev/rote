@@ -334,7 +334,7 @@ fn handle_playback_event(
         PlaybackEvent::Paused => {
             state.paused = true;
             state.waiting_for_confirmation = true;
-            state.status = "Paused. [Enter] next step, [Space] resume.".to_owned();
+            "Paused. [Enter] next step, [Space] resume.".clone_into(&mut state.status);
         }
         PlaybackEvent::Resumed => {
             state.paused = false;
