@@ -21,6 +21,8 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub struct BrowserProcess {
     child: process::Child,
     port: u16,
+    // Retained for future use (e.g., diagnostics); not read at runtime.
+    #[allow(dead_code)]
     profile_dir: PathBuf,
 }
 
@@ -107,14 +109,16 @@ impl BrowserProcess {
 impl Drop for BrowserProcess {
     fn drop(&mut self) {
         self.kill();
-        // Best-effort cleanup of the profile directory.
-        let _ = fs::remove_dir_all(&self.profile_dir);
     }
 }
 
-/// Create a temporary profile directory for the browser session.
+/// Return the persistent profile directory for the default browser session.
+///
+/// Creates the directory if it doesn't exist.
 fn create_profile_dir() -> Result<PathBuf, CdpError> {
-    let dir = std::env::temp_dir().join(format!("rote-profile-{}", process::id()));
+    let data_dir = dirs::data_dir()
+        .ok_or_else(|| CdpError::BrowserLaunch("could not determine platform data directory".into()))?;
+    let dir = data_dir.join("rote").join("profiles").join("default");
     fs::create_dir_all(&dir).map_err(|e| {
         CdpError::BrowserLaunch(format!(
             "failed to create profile directory {}: {e}",

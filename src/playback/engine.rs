@@ -1095,7 +1095,10 @@ mod tests {
             })
             .collect();
         assert_eq!(changed, vec![4.0], "clamped multiplier should be 4.0");
-        assert_eq!(engine.speed_multiplier, 4.0);
+        #[allow(clippy::float_cmp)] // 4.0 is exact in IEEE 754
+        {
+            assert_eq!(engine.speed_multiplier, 4.0);
+        }
     }
 
     #[tokio::test]
@@ -1126,7 +1129,10 @@ mod tests {
             })
             .collect();
         assert_eq!(changed, vec![0.25], "clamped multiplier should be 0.25");
-        assert_eq!(engine.speed_multiplier, 0.25);
+        #[allow(clippy::float_cmp)] // 0.25 is exact in IEEE 754
+        {
+            assert_eq!(engine.speed_multiplier, 0.25);
+        }
     }
 
     // ── Column-count cross-check ──────────────────────────────────────────
