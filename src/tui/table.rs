@@ -127,11 +127,7 @@ impl TableState {
             return idx;
         }
         // Last Done.
-        if let Some(idx) = self
-            .row_states
-            .iter()
-            .rposition(|&s| s == RowState::Done)
-        {
+        if let Some(idx) = self.row_states.iter().rposition(|&s| s == RowState::Done) {
             return idx;
         }
         0
@@ -152,7 +148,9 @@ impl TableState {
 /// Changing how "Done" looks means changing only this function.
 fn cell_style(cell: CellState, row: RowState) -> Style {
     match (cell, row) {
-        (CellState::Done, _) => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        (CellState::Done, _) => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
         (CellState::Pending, RowState::InProgress) => Style::default(),
         (CellState::Pending, RowState::Upcoming | RowState::Done) => {
             Style::default().fg(Color::DarkGray)
@@ -163,7 +161,9 @@ fn cell_style(cell: CellState, row: RowState) -> Style {
 /// Style for the row-number cell on the left.
 fn row_num_style(row: RowState) -> Style {
     match row {
-        RowState::InProgress => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        RowState::InProgress => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
         RowState::Done => Style::default().fg(Color::Green),
         RowState::Upcoming => Style::default().fg(Color::DarkGray),
     }
@@ -184,7 +184,9 @@ pub(crate) fn draw_table(frame: &mut Frame, area: Rect, dataset: &DataSet, state
     let row_count = dataset.row_count();
 
     // Row-number column width: wide enough for the largest row number.
-    let row_num_width = u16::try_from(row_count.to_string().len()).unwrap_or(4).max(2);
+    let row_num_width = u16::try_from(row_count.to_string().len())
+        .unwrap_or(4)
+        .max(2);
 
     // Determine which columns fit starting from viewport_col.
     // Available width after row-number column and its separator.
@@ -233,11 +235,7 @@ fn visible_column_range(state: &TableState, col_count: usize, available_width: u
     cols
 }
 
-fn build_header(
-    dataset: &DataSet,
-    visible_cols: &[usize],
-    row_num_width: u16,
-) -> Row<'static> {
+fn build_header(dataset: &DataSet, visible_cols: &[usize], row_num_width: u16) -> Row<'static> {
     let num_cell = Cell::new(" ".repeat(usize::from(row_num_width))).dark_gray();
 
     let col_cells: Vec<Cell<'static>> = visible_cols
@@ -326,9 +324,7 @@ fn compute_col_widths(dataset: &DataSet) -> Vec<u16> {
 
 /// Strip non-printable characters (0x00–0x1f and 0x7f) from a string.
 fn sanitize(s: &str) -> String {
-    s.chars()
-        .filter(|&c| c >= '\x20' && c != '\x7f')
-        .collect()
+    s.chars().filter(|&c| c >= '\x20' && c != '\x7f').collect()
 }
 
 /// Truncate a string to `MAX_COL_WIDTH` characters, appending `…` if truncated.
@@ -336,8 +332,8 @@ fn truncate(s: &str) -> String {
     let max = usize::from(MAX_COL_WIDTH);
     let mut chars = s.char_indices().skip(max.saturating_sub(1));
     match chars.next() {
-        None => s.to_owned(),                                      // < max chars
-        Some((_, _)) if chars.next().is_none() => s.to_owned(),    // exactly max chars
+        None => s.to_owned(),                                   // < max chars
+        Some((_, _)) if chars.next().is_none() => s.to_owned(), // exactly max chars
         Some((byte_pos, _)) => {
             let mut t = s[..byte_pos].to_owned();
             t.push('…');

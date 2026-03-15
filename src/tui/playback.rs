@@ -156,8 +156,14 @@ pub async fn run(
             table_state.update_viewport(table_area_height);
             draw(frame, &table_state, &dataset, &screen);
         })?;
-        wait_for_quit(terminal, &mut table_state, &dataset, &screen, &mut terminal_events)
-            .await?;
+        wait_for_quit(
+            terminal,
+            &mut table_state,
+            &dataset,
+            &screen,
+            &mut terminal_events,
+        )
+        .await?;
     }
 
     Ok(if let Some(ref error) = screen.error {
@@ -178,8 +184,8 @@ struct ScreenState {
     rows_completed: usize,
     rows_skipped: usize,
     speed: PlaybackSpeed,
-    /// User explicitly paused with Space. Independent of speed.
-    paused: bool,
+    /// Speed multiplier set via +/- keys. Independent of mode.
+    speed_multiplier: f64,
     status: String,
     finished: bool,
     error: Option<String>,
@@ -198,7 +204,7 @@ impl ScreenState {
             rows_completed: 0,
             rows_skipped: 0,
             speed,
-            paused: false,
+            speed_multiplier: 1.0,
             status: format!("Playing {playback_rows} rows..."),
             finished: false,
             error: None,
@@ -264,22 +270,7 @@ fn handle_key_event(
         return true;
     }
 
-    // Space: pause ↔ resume.
-    if key.code == KeyCode::Char(' ') {
-        if state.paused {
-            // Resume: clear pause and advance past the gate.
-            state.paused = false;
-            let _ = control_tx.send(PlaybackControl::Resume);
-            state.waiting_for_confirmation = false;
-        } else {
-            // Pause: engine will gate after the current step.
-            state.paused = true;
-            let _ = control_tx.send(PlaybackControl::Pause);
-        }
-        return false;
-    }
-
-    // Enter: proceed past a confirmation gate (speed-based or paused).
+    // Enter: proceed past a confirmation gate (speed-based).
     if key.code == KeyCode::Enter && state.waiting_for_confirmation {
         let _ = control_tx.send(PlaybackControl::Proceed);
         state.waiting_for_confirmation = false;
@@ -298,10 +289,25 @@ fn handle_key_event(
         state.speed = speed;
         let _ = control_tx.send(PlaybackControl::SetSpeed(speed));
         // If at a gate, auto-proceed so the new speed takes effect immediately.
-        if state.waiting_for_confirmation && !state.paused {
+        if state.waiting_for_confirmation {
             let _ = control_tx.send(PlaybackControl::Proceed);
             state.waiting_for_confirmation = false;
         }
+    }
+
+    // Speed multiplier: +/= increases, - decreases (step 0.25, clamped 0.25..=4.0).
+    match key.code {
+        KeyCode::Char('+' | '=') => {
+            let new_m = (state.speed_multiplier + 0.25).min(4.0);
+            state.speed_multiplier = new_m;
+            let _ = control_tx.send(PlaybackControl::SetSpeedMultiplier(new_m));
+        }
+        KeyCode::Char('-') => {
+            let new_m = (state.speed_multiplier - 0.25).max(0.25);
+            state.speed_multiplier = new_m;
+            let _ = control_tx.send(PlaybackControl::SetSpeedMultiplier(new_m));
+        }
+        _ => {}
     }
 
     false
@@ -331,29 +337,19 @@ fn handle_playback_event(
                 table_state.set_cell_state(row_index, col, CellState::Done);
             }
         }
-        PlaybackEvent::Paused => {
-            state.paused = true;
-            state.waiting_for_confirmation = true;
-            "Paused. [Enter] next step, [Space] resume.".clone_into(&mut state.status);
-        }
-        PlaybackEvent::Resumed => {
-            state.paused = false;
-            state.waiting_for_confirmation = false;
-        }
         PlaybackEvent::WaitingForConfirmation => {
             state.waiting_for_confirmation = true;
-            // Don't overwrite the "Paused" status — the paused message
-            // is more informative than the speed-based gate message.
-            if !state.paused {
-                state.status = match state.speed {
-                    PlaybackSpeed::Step => "Field complete. [Enter] next field.".to_owned(),
-                    PlaybackSpeed::Walk => "Row complete. [Enter] next row.".to_owned(),
-                    PlaybackSpeed::Run => "Waiting...".to_owned(),
-                };
-            }
+            state.status = match state.speed {
+                PlaybackSpeed::Step => "Field complete. [Enter] next field.".to_owned(),
+                PlaybackSpeed::Walk => "Row complete. [Enter] next row.".to_owned(),
+                PlaybackSpeed::Run => "Waiting...".to_owned(),
+            };
         }
         PlaybackEvent::SpeedChanged(speed) => {
             state.speed = speed;
+        }
+        PlaybackEvent::SpeedMultiplierChanged(m) => {
+            state.speed_multiplier = m;
         }
         PlaybackEvent::RowCompleted { row_index } => {
             state.rows_completed += 1;
@@ -365,11 +361,7 @@ fn handle_playback_event(
             step_index,
             error,
         } => {
-            state.status = format!(
-                "Row {}, step {}: {error}",
-                row_index + 1,
-                step_index + 1,
-            );
+            state.status = format!("Row {}, step {}: {error}", row_index + 1, step_index + 1,);
             state.error_prompt = Some(error);
         }
         PlaybackEvent::Finished {
@@ -406,12 +398,12 @@ fn draw(frame: &mut Frame, table_state: &TableState, dataset: &DataSet, state: &
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, state: &ScreenState) {
     let display_row = state.current_row + 1;
-    let paused_indicator = if state.paused { "  ⏸ PAUSED" } else { "" };
     let header = format!(
-        "Playback — Row {} of {}   Speed: {}{paused_indicator}",
+        "Playback — Row {} of {}   Mode: {}   Speed: {:.1}\u{00d7}",
         display_row,
         state.total_rows,
         speed_label(state.speed),
+        state.speed_multiplier,
     );
 
     let hint: Vec<Span<'_>> = if state.finished {
@@ -433,12 +425,6 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, state: &ScreenState) {
             Span::styled("[Enter]", Style::default().fg(Color::Green)),
             Span::raw(" Proceed   "),
         ];
-        if state.paused {
-            spans.extend([
-                Span::styled("[Space]", Style::default().fg(Color::Green)),
-                Span::raw(" Resume   "),
-            ]);
-        }
         spans.extend(speed_key_hints());
         spans.extend([
             Span::styled("[q]", Style::default().fg(Color::Red)),
@@ -446,11 +432,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, state: &ScreenState) {
         ]);
         spans
     } else {
-        let mut spans = vec![
-            Span::styled("[Space]", Style::default().fg(Color::Green)),
-            Span::raw(" Pause   "),
-        ];
-        spans.extend(speed_key_hints());
+        let mut spans = speed_key_hints();
         spans.extend([
             Span::styled("[q]", Style::default().fg(Color::Red)),
             Span::raw(" Stop"),
@@ -514,10 +496,12 @@ fn speed_label(speed: PlaybackSpeed) -> &'static str {
     }
 }
 
-/// Key-hint spans for the 1/2/3 speed keys.
+/// Key-hint spans for the 1/2/3 mode keys and +/- multiplier keys.
 fn speed_key_hints() -> Vec<Span<'static>> {
     vec![
         Span::styled("[1-3]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Mode   "),
+        Span::styled("[+/-]", Style::default().fg(Color::Cyan)),
         Span::raw(" Speed   "),
     ]
 }

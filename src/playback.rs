@@ -41,16 +41,15 @@ pub enum PlaybackError {
 #[derive(Debug, Clone)]
 #[allow(clippy::module_name_repetitions)]
 pub enum PlaybackControl {
-    /// Advance past the current gate without changing pause state.
-    /// Used for Enter (single-step while paused, or proceed at a speed gate).
+    /// Advance past the current gate (speed-based).
+    /// Used for Enter at a speed gate.
     Proceed,
-    /// Clear the paused flag and advance past the current gate.
-    /// Used for Space when paused.
-    Resume,
     /// Change playback speed.
     SetSpeed(crate::workflow::PlaybackSpeed),
-    /// Pause playback. Engine gates after every step until resumed.
-    Pause,
+    /// Set the speed multiplier (clamped to 0.25..=4.0).
+    ///
+    /// 2.0 means twice as fast (half the delay); 0.5 means half as fast.
+    SetSpeedMultiplier(f64),
     /// Respond to a step error.
     ErrorResponse(ErrorAction),
 }
@@ -118,11 +117,8 @@ pub enum PlaybackEvent {
     },
     /// Playback speed changed.
     SpeedChanged(crate::workflow::PlaybackSpeed),
-    /// Engine is paused (user pressed Space), waiting for [`PlaybackControl::Proceed`] or
-    /// [`PlaybackControl::Resume`].
-    Paused,
-    /// Engine resumed from paused state.
-    Resumed,
+    /// Speed multiplier changed.
+    SpeedMultiplierChanged(f64),
     /// Engine is at a confirmation gate (speed-based), waiting for [`PlaybackControl::Proceed`].
     WaitingForConfirmation,
     /// A step failed.

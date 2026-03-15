@@ -127,9 +127,10 @@ pub struct PlaybackEngine {
     /// Row to start (or resume) from.
     current_row: usize,
     speed: PlaybackSpeed,
-    /// When true, engine gates after every step regardless of speed.
-    /// Set by [`PlaybackControl::Pause`], cleared by [`PlaybackControl::Proceed`].
-    paused: bool,
+    /// Multiplier applied to delay sleeps.
+    ///
+    /// 2.0 = twice as fast (half the delay). Clamped to 0.25..=4.0.
+    speed_multiplier: f64,
     config: PlaybackConfig,
     /// Receives control signals from the TUI / CLI.
     control_rx: mpsc::UnboundedReceiver<PlaybackControl>,
@@ -161,7 +162,7 @@ impl PlaybackEngine {
             data,
             current_row: start_row,
             speed,
-            paused: false,
+            speed_multiplier: 1.0,
             config: PlaybackConfig::default(),
             control_rx,
             event_tx,
@@ -294,10 +295,12 @@ impl PlaybackEngine {
             // Sleep the per-step delay *before* executing, matching training
             // semantics: step_delays[i] is the gap before step i was recorded.
             // step_delays[0] is always zero so the first step runs immediately.
-            if !self.paused && !needs_step_gate(self.speed, &step) {
+            // The speed_multiplier scales the delay: 2.0× speed = half the delay.
+            if !needs_step_gate(self.speed, &step) {
                 let delay = self.workflow.step_delays[step_index];
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    let scaled = delay.mul_f64(1.0 / self.speed_multiplier);
+                    tokio::time::sleep(scaled).await;
                 }
             }
 
@@ -324,12 +327,12 @@ impl PlaybackEngine {
                         step_index,
                     });
 
-                    // Always drain pending control messages (speed changes,
-                    // pause) between steps — even in ungated modes. This is
-                    // what makes "slow down from Run" work.
+                    // Always drain pending control messages (speed changes)
+                    // between steps — even in ungated modes. This is what
+                    // makes "slow down from Run" work.
                     self.apply_pending_controls()?;
 
-                    if self.paused || needs_step_gate(self.speed, &step) {
+                    if needs_step_gate(self.speed, &step) {
                         self.wait_for_confirmation().await?;
                     }
                 }
@@ -361,16 +364,17 @@ impl PlaybackEngine {
 
         // Sleep the row-end delay when not gated, to reproduce the natural
         // pause captured between the last step and row finalization during
-        // training.
-        if !self.paused && !needs_row_gate(self.speed) {
+        // training. The speed_multiplier scales the delay.
+        if !needs_row_gate(self.speed) {
             let delay = self.workflow.row_end_delay;
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                let scaled = delay.mul_f64(1.0 / self.speed_multiplier);
+                tokio::time::sleep(scaled).await;
             }
         }
 
-        // Row-level gate: pause after all steps if speed is Walk, or if paused.
-        if self.paused || needs_row_gate(self.speed) {
+        // Row-level gate: wait after all steps if speed is Walk.
+        if needs_row_gate(self.speed) {
             self.wait_for_confirmation().await?;
         }
 
@@ -379,7 +383,7 @@ impl PlaybackEngine {
 
     /// Drain all pending control messages without blocking.
     ///
-    /// Applies [`PlaybackControl::SetSpeed`] and [`PlaybackControl::Pause`]
+    /// Applies [`PlaybackControl::SetSpeed`] and [`PlaybackControl::SetSpeedMultiplier`]
     /// immediately. [`PlaybackControl::Proceed`] and [`PlaybackControl::ErrorResponse`]
     /// are ignored (they only matter inside blocking gates).
     ///
@@ -396,13 +400,12 @@ impl PlaybackEngine {
                     self.speed = speed;
                     let _ = self.event_tx.send(PlaybackEvent::SpeedChanged(speed));
                 }
-                Ok(PlaybackControl::Pause) => {
-                    self.paused = true;
-                    let _ = self.event_tx.send(PlaybackEvent::Paused);
-                }
-                Ok(PlaybackControl::Resume) => {
-                    self.paused = false;
-                    let _ = self.event_tx.send(PlaybackEvent::Resumed);
+                Ok(PlaybackControl::SetSpeedMultiplier(m)) => {
+                    let clamped = m.clamp(0.25, 4.0);
+                    self.speed_multiplier = clamped;
+                    let _ = self
+                        .event_tx
+                        .send(PlaybackEvent::SpeedMultiplierChanged(clamped));
                 }
                 // Proceed and ErrorResponse are only meaningful inside blocking gates.
                 Ok(PlaybackControl::Proceed | PlaybackControl::ErrorResponse(_)) => {}
@@ -418,7 +421,7 @@ impl PlaybackEngine {
 
     /// Block at a confirmation gate until [`PlaybackControl::Proceed`] is received.
     ///
-    /// While waiting, [`PlaybackControl::SetSpeed`] and [`PlaybackControl::Pause`]
+    /// While waiting, [`PlaybackControl::SetSpeed`] and [`PlaybackControl::SetSpeedMultiplier`]
     /// are handled transparently.
     ///
     /// # Errors
@@ -429,26 +432,19 @@ impl PlaybackEngine {
 
         loop {
             match self.control_rx.recv().await {
-                // Advance past gate. Paused state unchanged — if paused,
-                // the next step will gate again (single-step advance).
                 Some(PlaybackControl::Proceed) => return Ok(()),
-
-                // Clear pause and advance past gate.
-                Some(PlaybackControl::Resume) => {
-                    self.paused = false;
-                    let _ = self.event_tx.send(PlaybackEvent::Resumed);
-                    return Ok(());
-                }
 
                 Some(PlaybackControl::SetSpeed(speed)) => {
                     self.speed = speed;
                     let _ = self.event_tx.send(PlaybackEvent::SpeedChanged(speed));
                 }
 
-                Some(PlaybackControl::Pause) => {
-                    self.paused = true;
-                    let _ = self.event_tx.send(PlaybackEvent::Paused);
-                    // Still waiting for Proceed or Resume.
+                Some(PlaybackControl::SetSpeedMultiplier(m)) => {
+                    let clamped = m.clamp(0.25, 4.0);
+                    self.speed_multiplier = clamped;
+                    let _ = self
+                        .event_tx
+                        .send(PlaybackEvent::SpeedMultiplierChanged(clamped));
                 }
 
                 // Ignore error responses while at a confirmation gate.
@@ -462,7 +458,7 @@ impl PlaybackEngine {
 
     /// Block until a [`PlaybackControl::ErrorResponse`] is received.
     ///
-    /// While waiting, [`PlaybackControl::SetSpeed`] and [`PlaybackControl::Pause`]
+    /// While waiting, [`PlaybackControl::SetSpeed`] and [`PlaybackControl::SetSpeedMultiplier`]
     /// are handled transparently.
     ///
     /// # Errors
@@ -478,14 +474,12 @@ impl PlaybackEngine {
                     let _ = self.event_tx.send(PlaybackEvent::SpeedChanged(speed));
                 }
 
-                Some(PlaybackControl::Pause) => {
-                    self.paused = true;
-                    let _ = self.event_tx.send(PlaybackEvent::Paused);
-                }
-
-                Some(PlaybackControl::Resume) => {
-                    self.paused = false;
-                    let _ = self.event_tx.send(PlaybackEvent::Resumed);
+                Some(PlaybackControl::SetSpeedMultiplier(m)) => {
+                    let clamped = m.clamp(0.25, 4.0);
+                    self.speed_multiplier = clamped;
+                    let _ = self
+                        .event_tx
+                        .send(PlaybackEvent::SpeedMultiplierChanged(clamped));
                 }
 
                 // Ignore Proceed while in error state.
@@ -612,7 +606,15 @@ mod tests {
     }
 
     fn empty_workflow() -> Workflow {
-        Workflow::new(1, vec![], vec![], Duration::ZERO, vec![], BTreeMap::new(), None)
+        Workflow::new(
+            1,
+            vec![],
+            vec![],
+            Duration::ZERO,
+            vec![],
+            BTreeMap::new(),
+            None,
+        )
     }
 
     fn workflow_with_steps(steps: Vec<Step>) -> Workflow {
@@ -946,37 +948,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn pause_at_run_gates_engine() {
-        // Many steps at Run speed. Pre-load Pause so the engine picks it up
-        // between steps and gates.
-        let steps = vec![click_step(), type_step(), click_step()];
-        let (mut engine, ctrl_tx, mut event_rx) = test_engine(
-            workflow_with_steps(steps),
-            dataset(&["a", "b", "c"]),
-            PlaybackSpeed::Run,
-            0,
-        );
-
-        // Pre-load pause.
-        ctrl_tx.send(PlaybackControl::Pause).unwrap();
-
-        let handle = tokio::spawn(async move { engine.run_with(OkExecutor).await });
-
-        // Give the engine time to hit the gate.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let events = drain_events(&mut event_rx);
-        assert!(
-            events.iter().any(|e| matches!(e, PlaybackEvent::Paused)),
-            "engine should have emitted Paused",
-        );
-
-        // Resume and let it finish.
-        ctrl_tx.send(PlaybackControl::Resume).unwrap();
-        let result = handle.await.unwrap();
-        assert!(result.is_ok());
-    }
-
     // ── Error-handling tests ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -1088,6 +1059,74 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(matches!(result, Err(PlaybackError::Stopped)));
+    }
+
+    // ── Speed-multiplier tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_speed_multiplier_applied_in_pending_controls() {
+        // Engine runs at Run speed (no gates). Pre-load a SetSpeedMultiplier
+        // so apply_pending_controls picks it up between steps, then verify
+        // the multiplier is reflected via a SpeedMultiplierChanged event.
+        let steps = vec![click_step()];
+        let (mut engine, ctrl_tx, mut event_rx) = test_engine(
+            workflow_with_steps(steps),
+            dataset(&["x"]),
+            PlaybackSpeed::Run,
+            0,
+        );
+
+        // Clamp test: 8.0 should be stored as 4.0.
+        ctrl_tx
+            .send(PlaybackControl::SetSpeedMultiplier(8.0))
+            .unwrap();
+
+        engine.run_with(OkExecutor).await.unwrap();
+
+        let events = drain_events(&mut event_rx);
+        let changed: Vec<f64> = events
+            .iter()
+            .filter_map(|e| {
+                if let PlaybackEvent::SpeedMultiplierChanged(m) = e {
+                    Some(*m)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(changed, vec![4.0], "clamped multiplier should be 4.0");
+        assert_eq!(engine.speed_multiplier, 4.0);
+    }
+
+    #[tokio::test]
+    async fn set_speed_multiplier_clamps_below() {
+        let steps = vec![click_step()];
+        let (mut engine, ctrl_tx, mut event_rx) = test_engine(
+            workflow_with_steps(steps),
+            dataset(&["x"]),
+            PlaybackSpeed::Run,
+            0,
+        );
+
+        ctrl_tx
+            .send(PlaybackControl::SetSpeedMultiplier(0.1))
+            .unwrap();
+
+        engine.run_with(OkExecutor).await.unwrap();
+
+        let events = drain_events(&mut event_rx);
+        let changed: Vec<f64> = events
+            .iter()
+            .filter_map(|e| {
+                if let PlaybackEvent::SpeedMultiplierChanged(m) = e {
+                    Some(*m)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(changed, vec![0.25], "clamped multiplier should be 0.25");
+        assert_eq!(engine.speed_multiplier, 0.25);
     }
 
     // ── Column-count cross-check ──────────────────────────────────────────

@@ -97,7 +97,8 @@ pub enum Command {
 
     // User commands from the TUI.
     /// Advance to the next data row.
-    #[allow(dead_code)] // Available for multi-row training flows; currently training is one row.
+    #[allow(dead_code)]
+    // Available for multi-row training flows; currently training is one row.
     AdvanceRow,
     /// Change the playback speed.
     #[allow(dead_code)] // Wired in a future milestone.

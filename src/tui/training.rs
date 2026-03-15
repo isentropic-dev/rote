@@ -12,13 +12,13 @@ use ratatui::{
 };
 use tokio::sync::{broadcast, mpsc};
 
+use super::table::{self, CellState, RowState, TableState};
 use crate::{
     cdp::{Browser, Event as CdpEvent},
     data::DataSet,
     training::{Command, TrainingCore, TrainingEvent, recorder},
     workflow::{Resolution, Step, ValueSource, Workflow},
 };
-use super::table::{self, CellState, RowState, TableState};
 
 /// Result of the training screen.
 pub enum TrainingOutcome {
@@ -82,7 +82,15 @@ pub async fn run(
         terminal.draw(|frame| {
             let table_area_height = frame.area().height.saturating_sub(5);
             table_state.update_viewport(table_area_height);
-            draw(frame, &table_state, &last_status, recording, capturing_transition, &core, dataset);
+            draw(
+                frame,
+                &table_state,
+                &last_status,
+                recording,
+                capturing_transition,
+                &core,
+                dataset,
+            );
         })?;
 
         tokio::select! {
@@ -194,7 +202,14 @@ fn handle_browser_event(
         Ok(event) => {
             if let Some(command) = training_command_from_cdp_event(&event) {
                 core.process(command);
-                drain_training_events(event_rx, table_state, last_status, capturing_transition, core, dataset);
+                drain_training_events(
+                    event_rx,
+                    table_state,
+                    last_status,
+                    capturing_transition,
+                    core,
+                    dataset,
+                );
             }
         }
         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -246,7 +261,9 @@ fn drain_training_events(
                 // but readability wins on this infrequent path.
                 #[allow(clippy::assigning_clones)]
                 {
-                    *last_status = "All fields mapped. Submit the form and navigate back, then press Enter.".to_owned();
+                    *last_status =
+                        "All fields mapped. Submit the form and navigate back, then press Enter."
+                            .to_owned();
                 }
             }
             TrainingEvent::RowAdvanced { row_index } => {
@@ -311,7 +328,15 @@ fn draw(
     let status_area = chunks[1];
 
     table::draw_table(frame, table_area, dataset, table_state);
-    draw_status_bar(frame, status_area, last_status, recording, capturing_transition, core, dataset);
+    draw_status_bar(
+        frame,
+        status_area,
+        last_status,
+        recording,
+        capturing_transition,
+        core,
+        dataset,
+    );
 }
 
 fn draw_status_bar(
@@ -326,17 +351,17 @@ fn draw_status_bar(
     let current = core.current_row_index();
     let total = dataset.row_count();
 
-    let bound = core
-        .bound_columns()
-        .iter()
-        .filter(|b| b.is_some())
-        .count();
+    let bound = core.bound_columns().iter().filter(|b| b.is_some()).count();
     let required = core
         .current_row_data()
         .map_or(0, |r| r.iter().filter(|c| !c.is_empty()).count());
 
     let progress = if !recording {
-        format!("Training — Row {} of {}   Waiting to start", current + 1, total)
+        format!(
+            "Training — Row {} of {}   Waiting to start",
+            current + 1,
+            total
+        )
     } else if capturing_transition {
         format!(
             "Training — Row {} of {}   Mapped {}/{} columns — recording end-of-row actions",

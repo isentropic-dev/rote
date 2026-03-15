@@ -34,9 +34,7 @@ enum State {
 /// # Errors
 ///
 /// Returns an error if drawing or event reading fails.
-pub async fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-) -> io::Result<Outcome> {
+pub async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<Outcome> {
     let mut events = EventStream::new();
     let mut state = State::Launching;
     let mut launch = launch_browser();

@@ -74,9 +74,7 @@ async fn run_screens(
                 Some(serde_json::json!({ "url": target_url })),
             )
             .await
-            .map_err(|e| {
-                io::Error::other(format!("failed to navigate to {target_url}: {e}"))
-            })?;
+            .map_err(|e| io::Error::other(format!("failed to navigate to {target_url}: {e}")))?;
 
         // Wait for the page to finish loading so the navigation event
         // doesn't leak into the training workflow as a spurious step.
@@ -126,7 +124,9 @@ async fn wait_for_main_frame_navigation(
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => {
-                    return Err(io::Error::other("browser connection closed during navigation"));
+                    return Err(io::Error::other(
+                        "browser connection closed during navigation",
+                    ));
                 }
             }
         }

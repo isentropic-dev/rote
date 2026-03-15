@@ -250,9 +250,7 @@ impl TrainingCore {
             // Snapshot row-end delay now — the gap from the last step to
             // when all fields were mapped. This avoids capturing the time
             // the user spends reviewing the TUI before pressing Enter.
-            self.row_end_delay = self
-                .last_step_time
-                .map_or(Duration::ZERO, |t| t.elapsed());
+            self.row_end_delay = self.last_step_time.map_or(Duration::ZERO, |t| t.elapsed());
             self.emit(TrainingEvent::RowComplete {
                 row_index: self.current_row,
             });

@@ -43,8 +43,7 @@ mod serde_duration_millis_vec {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Duration>, D::Error> {
-        Vec::<u64>::deserialize(d)
-            .map(|v| v.into_iter().map(Duration::from_millis).collect())
+        Vec::<u64>::deserialize(d).map(|v| v.into_iter().map(Duration::from_millis).collect())
     }
 }
 
@@ -319,7 +318,11 @@ impl Workflow {
         }
         if self.row_end_delay > max_delay {
             return Err(WorkflowError::DelayTooLarge {
-                millis: self.row_end_delay.as_millis().try_into().unwrap_or(u64::MAX),
+                millis: self
+                    .row_end_delay
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
                 max: max_ms,
             });
         }
