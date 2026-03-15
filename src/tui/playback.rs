@@ -1,3 +1,9 @@
+// Playback screen: renders a live data table driven by `PlaybackEngine` events.
+//
+// Layout: main area (table) + 5-line bottom status bar.
+// Starts at `Cell` speed — the engine pauses after each `Type` step and waits
+// for the user to press Enter before continuing.
+
 use std::io;
 use std::pin::pin;
 
@@ -6,10 +12,10 @@ use futures_util::StreamExt;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style, Stylize},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
 };
 use tokio::sync::mpsc;
 
@@ -17,11 +23,15 @@ use crate::{
     cdp::Browser,
     data::DataSet,
     playback::{ErrorAction, PlaybackControl, PlaybackEngine, PlaybackEvent},
-    workflow::{PlaybackSpeed, Step, Workflow},
+    workflow::{PlaybackSpeed, Workflow},
 };
 
+use super::table::{self, CellState, RowState, TableState};
+
+// ── Public types ──────────────────────────────────────────────────────────────
+
 /// Result of the playback screen.
-#[allow(dead_code)] // Fields read by callers in future milestones.
+#[allow(dead_code)] // Variant fields available to callers; return value currently discarded.
 pub enum PlaybackOutcome {
     /// Playback completed (possibly with some rows skipped).
     Done {
@@ -32,8 +42,14 @@ pub enum PlaybackOutcome {
     Error(String),
 }
 
+// ── Entry point ───────────────────────────────────────────────────────────────
+
 /// Run the playback screen.
 ///
+/// Playback starts at `Cell` speed: the engine pauses after each `Type` step
+/// and waits for the user to press Enter before continuing.
+///
+/// Rows `0..start_row` are shown as already `Done` (trained).
 /// The browser is borrowed, not consumed — the caller keeps it alive
 /// so the browser window doesn't close when playback finishes.
 ///
@@ -48,32 +64,51 @@ pub async fn run(
     start_row: usize,
 ) -> io::Result<PlaybackOutcome> {
     let total_rows = dataset.row_count();
-    let total_steps = workflow.steps.len();
-    let step_summaries: Vec<String> = workflow.steps.iter().map(step_summary).collect();
+    let col_count = dataset.column_count();
+
+    // Build reverse lookup: step_index → column (if any).
+    // `column_bindings[col] = Some(step_idx)` means that step fills that column.
+    // Invert it so we can flip a cell Done when StepCompleted fires.
+    let step_to_column: Vec<Option<usize>> = (0..workflow.steps.len())
+        .map(|step_idx| {
+            workflow
+                .column_bindings
+                .iter()
+                .position(|b| *b == Some(step_idx))
+        })
+        .collect();
 
     let (mut engine, control_tx, mut event_rx) =
-        PlaybackEngine::new(workflow, dataset, PlaybackSpeed::Auto, start_row);
+        PlaybackEngine::new(workflow, dataset.clone(), PlaybackSpeed::Cell, start_row);
 
     // Drive the engine as a pinned future alongside the TUI event loop.
-    // We do NOT tokio::spawn — that would move the browser into the task
-    // and drop it (killing the browser process) when the task completes.
+    // We do NOT tokio::spawn — that would move the browser into a task and
+    // drop it (killing the browser process) when the task completes.
     let mut engine_future = pin!(engine.run(browser));
     let mut engine_done = false;
 
     let mut terminal_events = EventStream::new();
-    let mut state = PlaybackScreenState::new(
-        total_rows,
-        total_steps,
-        step_summaries,
-        start_row,
-        PlaybackSpeed::Auto,
-    );
+
+    // Initialize table state: rows before start_row are already Done.
+    let mut table_state = TableState::new(total_rows, col_count, &dataset);
+    for row in 0..start_row {
+        for col in 0..col_count {
+            table_state.set_cell_state(row, col, CellState::Done);
+        }
+        table_state.set_row_state(row, RowState::Done);
+    }
+
+    let mut screen = ScreenState::new(total_rows, start_row, PlaybackSpeed::Cell);
     let mut user_quit = false;
 
     loop {
-        terminal.draw(|frame| draw(frame, &state))?;
+        terminal.draw(|frame| {
+            let table_area_height = frame.area().height.saturating_sub(5);
+            table_state.update_viewport(table_area_height);
+            draw(frame, &table_state, &dataset, &screen);
+        })?;
 
-        if state.finished {
+        if screen.finished {
             break;
         }
 
@@ -84,7 +119,7 @@ pub async fn run(
                     break;
                 };
 
-                if handle_key_event(&event_result?, &mut state, &control_tx) {
+                if handle_key_event(&event_result?, &mut screen, &control_tx) {
                     user_quit = true;
                     break;
                 }
@@ -93,24 +128,18 @@ pub async fn run(
                 let Some(event) = maybe_event else {
                     // Engine dropped the sender without sending Finished.
                     engine_done = true;
-                    if !state.finished {
-                        state.finished = true;
-                        state.status = if state.error.is_some() {
-                            format!(
-                                "Stopped. {} completed, {} skipped. Press [q] to quit.",
-                                state.rows_completed, state.rows_skipped,
-                            )
-                        } else {
-                            format!(
-                                "Done! {} rows completed, {} skipped. Press [q] to quit.",
-                                state.rows_completed, state.rows_skipped,
-                            )
-                        };
+                    if !screen.finished {
+                        screen.finished = true;
+                        screen.status = format!(
+                            "Stopped. {} completed, {} skipped. Press [q] to quit.",
+                            screen.rows_completed, screen.rows_skipped,
+                        );
                     }
                     continue;
                 };
-                handle_playback_event(event, &mut state);
-                if state.finished {
+
+                handle_playback_event(event, &mut screen, &mut table_state, &step_to_column);
+                if screen.finished {
                     engine_done = true;
                 }
             }
@@ -122,29 +151,32 @@ pub async fn run(
 
     // Render final state and wait for 'q' (unless the user already quit).
     if !user_quit {
-        terminal.draw(|frame| draw(frame, &state))?;
-        wait_for_quit(terminal, &state, &mut terminal_events).await?;
+        terminal.draw(|frame| {
+            let table_area_height = frame.area().height.saturating_sub(5);
+            table_state.update_viewport(table_area_height);
+            draw(frame, &table_state, &dataset, &screen);
+        })?;
+        wait_for_quit(terminal, &mut table_state, &dataset, &screen, &mut terminal_events)
+            .await?;
     }
 
-    Ok(if let Some(ref error) = state.error {
+    Ok(if let Some(ref error) = screen.error {
         PlaybackOutcome::Error(error.clone())
     } else {
         PlaybackOutcome::Done {
-            rows_completed: state.rows_completed,
-            rows_skipped: state.rows_skipped,
+            rows_completed: screen.rows_completed,
+            rows_skipped: screen.rows_skipped,
         }
     })
 }
 
-struct PlaybackScreenState {
+// ── Screen state ──────────────────────────────────────────────────────────────
+
+struct ScreenState {
     total_rows: usize,
-    total_steps: usize,
-    step_summaries: Vec<String>,
     current_row: usize,
-    current_step: usize,
     rows_completed: usize,
     rows_skipped: usize,
-    row_log: Vec<String>,
     speed: PlaybackSpeed,
     status: String,
     finished: bool,
@@ -152,34 +184,17 @@ struct PlaybackScreenState {
     /// Engine is paused at a confirmation gate (Cell or Row speed).
     waiting_for_confirmation: bool,
     /// Engine hit an error and is waiting for the user to choose an action.
-    error_prompt: Option<ErrorPrompt>,
+    error_prompt: Option<String>,
 }
 
-/// State for the interactive error prompt.
-struct ErrorPrompt {
-    row_index: usize,
-    step_index: usize,
-    error: String,
-}
-
-impl PlaybackScreenState {
-    fn new(
-        total_rows: usize,
-        total_steps: usize,
-        step_summaries: Vec<String>,
-        start_row: usize,
-        speed: PlaybackSpeed,
-    ) -> Self {
+impl ScreenState {
+    fn new(total_rows: usize, start_row: usize, speed: PlaybackSpeed) -> Self {
         let playback_rows = total_rows.saturating_sub(start_row);
         Self {
             total_rows,
-            total_steps,
-            step_summaries,
             current_row: start_row,
-            current_step: 0,
             rows_completed: 0,
             rows_skipped: 0,
-            row_log: Vec::new(),
             speed,
             status: format!("Playing {playback_rows} rows..."),
             finished: false,
@@ -190,9 +205,12 @@ impl PlaybackScreenState {
     }
 }
 
+// ── Event handling ────────────────────────────────────────────────────────────
+
+/// Returns `true` if the caller should quit.
 fn handle_key_event(
     event: &Event,
-    state: &mut PlaybackScreenState,
+    state: &mut ScreenState,
     control_tx: &mpsc::UnboundedSender<PlaybackControl>,
 ) -> bool {
     let Event::Key(key) = event else {
@@ -207,7 +225,7 @@ fn handle_key_event(
         return true;
     }
 
-    // If finished, only 'q' exits.
+    // When finished, only 'q' exits.
     if state.finished {
         return key.code == KeyCode::Char('q');
     }
@@ -224,8 +242,8 @@ fn handle_key_event(
                 let _ = control_tx.send(PlaybackControl::ErrorResponse(ErrorAction::RetryRow));
             }
             KeyCode::Char('q') => {
-                if let Some(prompt) = state.error_prompt.take() {
-                    state.error = Some(prompt.error);
+                if let Some(error) = state.error_prompt.take() {
+                    state.error = Some(error);
                 }
                 let _ = control_tx.send(PlaybackControl::ErrorResponse(ErrorAction::Stop));
                 return true;
@@ -237,17 +255,18 @@ fn handle_key_event(
 
     // ── Normal playback mode ──────────────────────────────────────────
 
-    // Quit / stop.
+    // Quit.
     if key.code == KeyCode::Char('q') {
         let _ = control_tx.send(PlaybackControl::ErrorResponse(ErrorAction::Stop));
         return true;
     }
 
     // Space: pause ↔ resume.
+    // Pause drops to Manual; resume goes back to Cell (default for this session).
     if key.code == KeyCode::Char(' ') {
         if state.speed == PlaybackSpeed::Manual {
-            state.speed = PlaybackSpeed::Auto;
-            let _ = control_tx.send(PlaybackControl::SetSpeed(PlaybackSpeed::Auto));
+            state.speed = PlaybackSpeed::Cell;
+            let _ = control_tx.send(PlaybackControl::SetSpeed(PlaybackSpeed::Cell));
             let _ = control_tx.send(PlaybackControl::Proceed);
             state.waiting_for_confirmation = false;
         } else {
@@ -275,7 +294,7 @@ fn handle_key_event(
     if let Some(speed) = new_speed {
         state.speed = speed;
         let _ = control_tx.send(PlaybackControl::SetSpeed(speed));
-        // If we switched away from Manual while at a gate, auto-proceed.
+        // If switching away from Manual while at a gate, auto-proceed.
         if speed != PlaybackSpeed::Manual && state.waiting_for_confirmation {
             let _ = control_tx.send(PlaybackControl::Proceed);
             state.waiting_for_confirmation = false;
@@ -285,23 +304,35 @@ fn handle_key_event(
     false
 }
 
-fn handle_playback_event(event: PlaybackEvent, state: &mut PlaybackScreenState) {
+fn handle_playback_event(
+    event: PlaybackEvent,
+    state: &mut ScreenState,
+    table_state: &mut TableState,
+    step_to_column: &[Option<usize>],
+) {
     match event {
         PlaybackEvent::RowStarted { row_index } => {
             state.current_row = row_index;
-            state.current_step = 0;
-            let display_row = row_index + 1;
-            state.status = format!("Playing row {display_row} of {}...", state.total_rows,);
+            table_state.set_row_state(row_index, RowState::InProgress);
+            let display = row_index + 1;
+            state.status = format!("Playing row {display} of {}...", state.total_rows);
         }
-        PlaybackEvent::StepStarted { step_index, .. } => {
-            state.current_step = step_index;
+        PlaybackEvent::StepStarted { .. } => {}
+        PlaybackEvent::StepCompleted {
+            row_index,
+            step_index,
+        } => {
+            // Flip the cell for the column this step fills (if any).
+            // Clicks and navigations don't have column bindings; only Type steps do.
+            if let Some(col) = step_to_column.get(step_index).copied().flatten() {
+                table_state.set_cell_state(row_index, col, CellState::Done);
+            }
         }
-        PlaybackEvent::StepCompleted { .. } => {}
         PlaybackEvent::WaitingForConfirmation => {
             state.waiting_for_confirmation = true;
             state.status = match state.speed {
-                PlaybackSpeed::Manual => "Paused. [Enter] step forward, [Space] resume.".to_owned(),
-                PlaybackSpeed::Cell => "Waiting for confirmation. [Enter] next field.".to_owned(),
+                PlaybackSpeed::Manual => "Paused. [Enter] next step, [Space] resume.".to_owned(),
+                PlaybackSpeed::Cell => "Field complete. [Enter] next field.".to_owned(),
                 PlaybackSpeed::Row => "Row complete. [Enter] next row.".to_owned(),
                 PlaybackSpeed::Auto => "Waiting...".to_owned(),
             };
@@ -311,27 +342,20 @@ fn handle_playback_event(event: PlaybackEvent, state: &mut PlaybackScreenState) 
         }
         PlaybackEvent::RowCompleted { row_index } => {
             state.rows_completed += 1;
-            state
-                .row_log
-                .push(format!("✓ Row {} completed", row_index + 1));
+            table_state.set_row_state(row_index, RowState::Done);
+            state.waiting_for_confirmation = false;
         }
         PlaybackEvent::StepFailed {
             row_index,
             step_index,
             error,
         } => {
-            let msg = format!(
-                "✗ Row {} failed at step {}: {error}",
+            state.status = format!(
+                "Row {}, step {}: {error}",
                 row_index + 1,
                 step_index + 1,
             );
-            state.row_log.push(msg);
-            state.status = format!("Error on row {}, step {}.", row_index + 1, step_index + 1,);
-            state.error_prompt = Some(ErrorPrompt {
-                row_index,
-                step_index,
-                error,
-            });
+            state.error_prompt = Some(error);
         }
         PlaybackEvent::Finished {
             rows_completed,
@@ -353,178 +377,27 @@ fn handle_playback_event(event: PlaybackEvent, state: &mut PlaybackScreenState) 
     }
 }
 
-async fn wait_for_quit(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    state: &PlaybackScreenState,
-    terminal_events: &mut EventStream,
-) -> io::Result<()> {
-    loop {
-        terminal.draw(|frame| draw(frame, state))?;
+// ── Drawing ───────────────────────────────────────────────────────────────────
 
-        let Some(event_result) = terminal_events.next().await else {
-            return Ok(());
-        };
-        let event = event_result?;
-        let Event::Key(key) = event else {
-            continue;
-        };
-        if key.code == KeyCode::Char('q')
-            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
-            return Ok(());
-        }
-    }
-}
-
-// ─── Drawing ──────────────────────────────────────────────────────────────
-
-fn draw(frame: &mut Frame, state: &PlaybackScreenState) {
-    let has_error_prompt = state.error_prompt.is_some();
+fn draw(frame: &mut Frame, table_state: &TableState, dataset: &DataSet, state: &ScreenState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if has_error_prompt {
-            vec![
-                Constraint::Length(4),
-                Constraint::Min(4),
-                Constraint::Length(5),
-                Constraint::Length(4),
-            ]
-        } else {
-            vec![
-                Constraint::Length(4),
-                Constraint::Min(6),
-                Constraint::Length(0),
-                Constraint::Length(4),
-            ]
-        })
+        .constraints([Constraint::Min(1), Constraint::Length(5)])
         .split(frame.area());
 
-    draw_header(frame, chunks[0], state);
-    draw_progress(frame, chunks[1], state);
-    if has_error_prompt {
-        draw_error_prompt(frame, chunks[2], state);
-    }
-    draw_status(frame, chunks[3], state);
+    table::draw_table(frame, chunks[0], dataset, table_state);
+    draw_status_bar(frame, chunks[1], state);
 }
 
-fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackScreenState) {
+fn draw_status_bar(frame: &mut Frame, area: Rect, state: &ScreenState) {
     let display_row = state.current_row + 1;
-    let title = format!(" Playback — Row {display_row} of {} ", state.total_rows,);
-
-    let step_line = if state.finished {
-        "Playback complete.".to_owned()
-    } else if state.total_steps == 0 {
-        "No steps in workflow.".to_owned()
-    } else {
-        let step_num = state.current_step + 1;
-        let summary = state
-            .step_summaries
-            .get(state.current_step)
-            .cloned()
-            .unwrap_or_default();
-        format!("Step {step_num}/{}: {summary}", state.total_steps)
-    };
-
-    let paragraph = Paragraph::new(vec![
-        Line::from(format!("Playing row {display_row} of {}", state.total_rows)),
-        Line::from(step_line),
-    ])
-    .block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    )
-    .wrap(Wrap { trim: false });
-
-    frame.render_widget(paragraph, area);
-}
-
-fn draw_progress(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackScreenState) {
-    let items: Vec<ListItem<'_>> = if state.row_log.is_empty() {
-        vec![ListItem::new(Line::from("Waiting...").dark_gray())]
-    } else {
-        state
-            .row_log
-            .iter()
-            .map(|line| {
-                let style = if line.starts_with('✓') {
-                    Style::default().fg(Color::Green)
-                } else if line.starts_with('✗') {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(Line::from(line.as_str()).style(style))
-            })
-            .collect()
-    };
-
-    // Show in-progress row if not finished.
-    let mut items = items;
-    if !state.finished && !state.row_log.is_empty() {
-        items.push(ListItem::new(
-            Line::from(format!("▶ Row {} in progress...", state.current_row + 1))
-                .style(Style::default().fg(Color::Yellow)),
-        ));
-    }
-
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Progress ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green)),
+    let header = format!(
+        "Playback — Row {} of {}   Speed: {}",
+        display_row,
+        state.total_rows,
+        speed_label(state.speed),
     );
 
-    frame.render_widget(list, area);
-}
-
-fn speed_label(speed: PlaybackSpeed) -> &'static str {
-    match speed {
-        PlaybackSpeed::Manual => "Paused",
-        PlaybackSpeed::Cell => "Cell",
-        PlaybackSpeed::Row => "Row",
-        PlaybackSpeed::Auto => "Auto",
-    }
-}
-
-fn draw_error_prompt(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackScreenState) {
-    let Some(prompt) = &state.error_prompt else {
-        return;
-    };
-
-    let lines = vec![
-        Line::from(format!(
-            "Row {}, step {}: {}",
-            prompt.row_index + 1,
-            prompt.step_index + 1,
-            prompt.error,
-        ))
-        .style(Style::default().fg(Color::Red)),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("[s]", Style::default().fg(Color::Yellow)),
-            Span::raw(" Skip this row   "),
-            Span::styled("[r]", Style::default().fg(Color::Yellow)),
-            Span::raw(" Retry from step 1   "),
-            Span::styled("[q]", Style::default().fg(Color::Red)),
-            Span::raw(" Stop playback"),
-        ]),
-    ];
-
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Error ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
-        )
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(paragraph, area);
-}
-
-fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackScreenState) {
     let hint: Vec<Span<'_>> = if state.finished {
         vec![
             Span::styled("[q]", Style::default().fg(Color::Red)),
@@ -541,7 +414,6 @@ fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackS
         ]
     } else if state.waiting_for_confirmation {
         let mut spans = vec![
-            Span::raw(format!("Speed: {} ", speed_label(state.speed))),
             Span::styled("[Enter]", Style::default().fg(Color::Green)),
             Span::raw(" Proceed   "),
         ];
@@ -557,23 +429,15 @@ fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackS
             Span::raw(" Stop"),
         ]);
         spans
-    } else if state.speed == PlaybackSpeed::Manual {
-        let mut spans = vec![
-            Span::raw(format!("Speed: {} ", speed_label(state.speed))),
-            Span::styled("[Space]", Style::default().fg(Color::Green)),
-            Span::raw(" Resume   "),
-        ];
-        spans.extend(speed_key_hints());
-        spans.extend([
-            Span::styled("[q]", Style::default().fg(Color::Red)),
-            Span::raw(" Stop"),
-        ]);
-        spans
     } else {
+        let pause_resume = if state.speed == PlaybackSpeed::Manual {
+            " Resume   "
+        } else {
+            " Pause   "
+        };
         let mut spans = vec![
-            Span::raw(format!("Speed: {} ", speed_label(state.speed))),
             Span::styled("[Space]", Style::default().fg(Color::Green)),
-            Span::raw(" Pause   "),
+            Span::raw(pause_resume),
         ];
         spans.extend(speed_key_hints());
         spans.extend([
@@ -583,7 +447,11 @@ fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackS
         spans
     };
 
-    let lines = vec![Line::from(state.status.as_str()), Line::from(hint)];
+    let lines = vec![
+        Line::from(header.as_str()),
+        Line::from(state.status.as_str()),
+        Line::from(hint),
+    ];
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
@@ -595,32 +463,51 @@ fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, state: &PlaybackS
     frame.render_widget(paragraph, area);
 }
 
-/// Hint spans for the 1/2/3/4 speed keys.
+async fn wait_for_quit(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    table_state: &mut TableState,
+    dataset: &DataSet,
+    state: &ScreenState,
+    terminal_events: &mut EventStream,
+) -> io::Result<()> {
+    loop {
+        terminal.draw(|frame| {
+            let table_area_height = frame.area().height.saturating_sub(5);
+            table_state.update_viewport(table_area_height);
+            draw(frame, table_state, dataset, state);
+        })?;
+
+        let Some(event_result) = terminal_events.next().await else {
+            return Ok(());
+        };
+        let event = event_result?;
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if key.code == KeyCode::Char('q')
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return Ok(());
+        }
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Human-readable label for a playback speed.
+fn speed_label(speed: PlaybackSpeed) -> &'static str {
+    match speed {
+        PlaybackSpeed::Manual => "Manual",
+        PlaybackSpeed::Cell => "Cell",
+        PlaybackSpeed::Row => "Row",
+        PlaybackSpeed::Auto => "Auto",
+    }
+}
+
+/// Key-hint spans for the 1/2/3/4 speed keys.
 fn speed_key_hints() -> Vec<Span<'static>> {
     vec![
         Span::styled("[1-4]", Style::default().fg(Color::Cyan)),
         Span::raw(" Speed   "),
     ]
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────
-
-fn step_summary(step: &Step) -> String {
-    match step {
-        Step::Click { selector } => {
-            format!("Click {}", selector.tag)
-        }
-        Step::Type { selector, source } => {
-            let source_desc = match source {
-                crate::workflow::ValueSource::Column { index } => {
-                    format!("column {}", index + 1)
-                }
-                crate::workflow::ValueSource::Literal { value } => {
-                    format!("literal \"{value}\"")
-                }
-            };
-            format!("Type {source_desc} → {}", selector.tag)
-        }
-        Step::WaitForNavigation => "Wait for navigation".to_owned(),
-    }
 }

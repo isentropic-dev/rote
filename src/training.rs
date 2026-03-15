@@ -97,6 +97,7 @@ pub enum Command {
 
     // User commands from the TUI.
     /// Advance to the next data row.
+    #[allow(dead_code)] // Available for multi-row training flows; currently training is one row.
     AdvanceRow,
     /// Change the playback speed.
     #[allow(dead_code)] // Wired in a future milestone.
@@ -115,17 +116,24 @@ pub enum TrainingEvent {
     /// A new step was recorded.
     StepRecorded { index: usize, step: Step },
     /// An existing step was updated (e.g. from incremental typing).
+    /// Fields used by step detail pane (plan step 3).
+    #[allow(dead_code)]
     StepUpdated { index: usize, step: Step },
     /// A data column was bound to a step.
     ColumnBound { column: usize, step_index: usize },
     /// All required columns in the current row are bound.
-    RowComplete { row_index: usize },
+    RowComplete {
+        #[allow(dead_code)]
+        row_index: usize,
+    },
     /// Playback speed was changed.
     SpeedChanged(#[allow(dead_code)] PlaybackSpeed),
     /// A bound column has an empty cell in the current row.
     EmptyCellEncountered { column: usize, row_index: usize },
     /// An unbound column has a non-empty value in the current row.
     NewFieldEncountered { column: usize, value: String },
+    /// The training session moved to a new row.
+    RowAdvanced { row_index: usize },
     /// An error occurred.
     Error(String),
 }

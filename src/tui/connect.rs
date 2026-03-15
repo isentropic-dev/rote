@@ -28,10 +28,15 @@ enum State {
 
 /// Run the browser connect screen.
 ///
+/// Launches a browser and waits for the user to navigate to their form
+/// and press Enter to start recording.
+///
 /// # Errors
 ///
 /// Returns an error if drawing or event reading fails.
-pub async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<Outcome> {
+pub async fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> io::Result<Outcome> {
     let mut events = EventStream::new();
     let mut state = State::Launching;
     let mut launch = launch_browser();
@@ -131,10 +136,10 @@ fn draw(frame: &mut Frame, state: &State) {
         State::Ready(_) => vec![
             Line::from("Browser launched."),
             Line::from(""),
-            Line::from("Navigate to your form, then press Enter to start training."),
+            Line::from("Navigate to your form and press Enter to start recording."),
             Line::from(vec![
                 Span::styled("[Enter]", Style::default().fg(Color::Green)),
-                Span::raw(" Start training   "),
+                Span::raw(" Start recording   "),
                 Span::styled("[q]", Style::default().fg(Color::Red)),
                 Span::raw(" Quit"),
             ]),

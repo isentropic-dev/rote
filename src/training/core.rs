@@ -223,6 +223,9 @@ impl TrainingCore {
         }
 
         self.current_row += 1;
+        self.emit(TrainingEvent::RowAdvanced {
+            row_index: self.current_row,
+        });
 
         // Check for empty cells and new fields in the new row.
         if let Some(row) = self.data.row(self.current_row) {
@@ -303,7 +306,11 @@ impl TrainingCore {
             .find_map(|(i, stored)| stored.as_ref().filter(|s| s.same_element(info)).map(|_| i))
     }
 
-    /// Try to match a value to an unbound column in the current row.
+    /// Try to match a value to the next unbound column in the current row.
+    ///
+    /// Column-order training: only the leftmost unbound column is considered.
+    /// If the value matches that column's cell, it becomes a column binding.
+    /// Otherwise the value is treated as a literal.
     ///
     /// If `updating_step` is `Some`, columns currently bound to that step are
     /// considered "available" (since we're about to replace the step).
@@ -321,14 +328,16 @@ impl TrainingCore {
             );
         };
 
-        for (col, cell) in row.iter().enumerate() {
-            if cell == value {
-                let binding = self.column_bindings.get(col).copied().flatten();
-                let available = binding.is_none() || binding == updating_step;
-                if available {
-                    return (ValueSource::Column { index: col }, Some(col));
-                }
-            }
+        // Find the leftmost unbound column (considering updating_step as available).
+        let next_unbound = row.iter().enumerate().find(|(col, _cell)| {
+            let binding = self.column_bindings.get(*col).copied().flatten();
+            binding.is_none() || binding == updating_step
+        });
+
+        if let Some((col, cell)) = next_unbound
+            && cell == value
+        {
+            return (ValueSource::Column { index: col }, Some(col));
         }
 
         (
@@ -870,6 +879,127 @@ mod tests {
                 value: "N/A".to_owned()
             }),
         );
+    }
+
+    // -- build_workflow tests --
+
+    // -- Column-order training tests --
+
+    #[test]
+    fn column_order_skips_non_next_column_match() {
+        // Data: name=Alice, age=30. If user types "30" first,
+        // it should NOT bind to column 1 — column 0 is the next unbound.
+        let ds = test_data("name\tage\nAlice\t30\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserInput {
+            selector_info: sel("age-field", "#age-field"),
+            tag: "INPUT".to_owned(),
+            value: "30".to_owned(),
+        });
+
+        let events = drain_events(&mut rx);
+        // Should NOT emit a ColumnBound event — "30" matches column 1
+        // but column 0 is the next unbound column.
+        assert!(
+            !has_event(&events, |e| matches!(e, TrainingEvent::ColumnBound { .. })),
+            "should not bind a non-next column",
+        );
+
+        // Step should be a literal.
+        match &core.steps()[0] {
+            Step::Type { source, .. } => {
+                assert_eq!(
+                    *source,
+                    ValueSource::Literal {
+                        value: "30".to_owned()
+                    }
+                );
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn column_order_binds_leftmost_unbound() {
+        // Bind column 0 first, then column 1 becomes the next unbound.
+        let ds = test_data("name\tage\nAlice\t30\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Bind column 0.
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+        assert_eq!(core.bound_columns()[0], Some(0));
+
+        // Now "30" should bind to column 1 (the new leftmost unbound).
+        core.process(Command::BrowserInput {
+            selector_info: sel("age-field", "#age-field"),
+            tag: "INPUT".to_owned(),
+            value: "30".to_owned(),
+        });
+
+        let events = drain_events(&mut rx);
+        assert!(has_event(&events, |e| matches!(
+            e,
+            TrainingEvent::ColumnBound {
+                column: 1,
+                step_index: 1
+            }
+        )));
+        assert_eq!(core.bound_columns()[1], Some(1));
+    }
+
+    #[test]
+    fn column_order_nudge_rebinds_after_out_of_order_fill() {
+        // User fills age (col 1) first — literal. Then fills name (col 0) — binds.
+        // Then nudges age field — now col 1 is leftmost unbound, so it binds.
+        let ds = test_data("name\tage\nAlice\t30\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Type "30" into age field — col 0 is next unbound, no match → literal.
+        core.process(Command::BrowserInput {
+            selector_info: sel("age-field", "#age-field"),
+            tag: "INPUT".to_owned(),
+            value: "30".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+        assert!(core.bound_columns()[1].is_none());
+
+        // Type "Alice" into name field — col 0 is next unbound, matches → binds.
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+        assert_eq!(core.bound_columns()[0], Some(1));
+
+        // Nudge age field (delete and retype) — col 1 is now leftmost unbound.
+        core.process(Command::BrowserInput {
+            selector_info: sel("age-field", "#age-field"),
+            tag: "INPUT".to_owned(),
+            value: "30".to_owned(),
+        });
+
+        let events = drain_events(&mut rx);
+        assert!(
+            has_event(&events, |e| matches!(
+                e,
+                TrainingEvent::ColumnBound {
+                    column: 1,
+                    step_index: 0
+                }
+            )),
+            "nudge should bind col 1 to the existing age step",
+        );
+        assert!(core.is_row_complete());
     }
 
     // -- build_workflow tests --

@@ -40,6 +40,7 @@ impl DataSet {
     ///
     /// Returns `self` unchanged if headers are already set or there are no rows.
     #[must_use]
+    #[allow(dead_code)] // Available for callers that load without has_headers.
     pub fn with_first_row_as_headers(mut self) -> Self {
         if self.headers.is_none() && !self.rows.is_empty() {
             self.headers = Some(self.rows.remove(0));

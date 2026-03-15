@@ -1,0 +1,5 @@
+first_name	last_name	email	company	phone	street	city	state	zip	country	department	title
+Alice	Smith	alice@example.com	Acme Corp	555-0101	123 Main St	Springfield	IL	62701	US	Engineering	Senior Engineer
+Bob	Jones	bob@example.com	Widgets Inc	555-0102	456 Oak Ave	Portland	OR	97201	US	Sales	Account Manager
+Carol	Davis	carol@example.com	Tech Co	555-0103	789 Pine Rd	Austin	TX	78701	US	Marketing	Director
+Dan	Miller	dan@example.com	DataFlow	555-0104	321 Elm Blvd	Denver	CO	80201	US	Support	Team Lead

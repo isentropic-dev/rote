@@ -7,10 +7,6 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(version)]
 pub struct Args {
-    /// Load demo data for development (matches examples/demo-form/).
-    #[arg(long)]
-    pub demo_data: bool,
-
     /// Read data from the system clipboard.
     #[arg(long)]
     pub clipboard: bool,
@@ -22,4 +18,8 @@ pub struct Args {
     /// Load a saved workflow file.
     #[arg(long, value_name = "FILE")]
     pub workflow: Option<PathBuf>,
+
+    /// Navigate the browser to this URL and start training immediately.
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
 }
