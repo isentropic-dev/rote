@@ -18,19 +18,18 @@ use super::{ErrorAction, PlaybackConfig, PlaybackControl, PlaybackError, Playbac
 #[must_use]
 fn needs_step_gate(speed: PlaybackSpeed, step: &Step) -> bool {
     match speed {
-        PlaybackSpeed::Manual => true,
-        PlaybackSpeed::Cell => match step {
+        PlaybackSpeed::Step => match step {
             Step::Type { .. } => true,
             Step::Click { .. } | Step::WaitForNavigation => false,
         },
-        PlaybackSpeed::Row | PlaybackSpeed::Auto => false,
+        PlaybackSpeed::Walk | PlaybackSpeed::Run => false,
     }
 }
 
 /// Whether the engine should pause for confirmation after finishing a row.
 #[must_use]
 fn needs_row_gate(speed: PlaybackSpeed) -> bool {
-    speed == PlaybackSpeed::Row
+    speed == PlaybackSpeed::Walk
 }
 
 // ─── Internal executor abstraction ───────────────────────────────────────
@@ -128,6 +127,9 @@ pub struct PlaybackEngine {
     /// Row to start (or resume) from.
     current_row: usize,
     speed: PlaybackSpeed,
+    /// When true, engine gates after every step regardless of speed.
+    /// Set by [`PlaybackControl::Pause`], cleared by [`PlaybackControl::Proceed`].
+    paused: bool,
     config: PlaybackConfig,
     /// Receives control signals from the TUI / CLI.
     control_rx: mpsc::UnboundedReceiver<PlaybackControl>,
@@ -159,6 +161,7 @@ impl PlaybackEngine {
             data,
             current_row: start_row,
             speed,
+            paused: false,
             config: PlaybackConfig::default(),
             control_rx,
             event_tx,
@@ -311,7 +314,12 @@ impl PlaybackEngine {
                         step_index,
                     });
 
-                    if needs_step_gate(self.speed, &step) {
+                    // Always drain pending control messages (speed changes,
+                    // pause) between steps — even in ungated modes. This is
+                    // what makes "slow down from Run" work.
+                    self.apply_pending_controls()?;
+
+                    if self.paused || needs_step_gate(self.speed, &step) {
                         self.wait_for_confirmation().await?;
                     } else if !self.config.step_delay.is_zero() {
                         // Pace auto-advance modes: give the browser time
@@ -341,12 +349,55 @@ impl PlaybackEngine {
             }
         }
 
-        // Row-level gate: pause after all steps if speed is `Row`.
-        if needs_row_gate(self.speed) {
+        // Drain controls before the row gate — a speed change sent during
+        // the last step of the row might have switched us away from Row.
+        self.apply_pending_controls()?;
+
+        // Row-level gate: pause after all steps if speed is Walk, or if paused.
+        if self.paused || needs_row_gate(self.speed) {
             self.wait_for_confirmation().await?;
         }
 
         Ok(RowOutcome::Completed)
+    }
+
+    /// Drain all pending control messages without blocking.
+    ///
+    /// Applies [`PlaybackControl::SetSpeed`] and [`PlaybackControl::Pause`]
+    /// immediately. [`PlaybackControl::Proceed`] and [`PlaybackControl::ErrorResponse`]
+    /// are ignored (they only matter inside blocking gates).
+    ///
+    /// Called between every step so speed changes take effect even when the
+    /// engine is in an ungated mode (Row, Auto).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlaybackError::Stopped`] if the control channel is closed.
+    fn apply_pending_controls(&mut self) -> Result<(), PlaybackError> {
+        loop {
+            match self.control_rx.try_recv() {
+                Ok(PlaybackControl::SetSpeed(speed)) => {
+                    self.speed = speed;
+                    let _ = self.event_tx.send(PlaybackEvent::SpeedChanged(speed));
+                }
+                Ok(PlaybackControl::Pause) => {
+                    self.paused = true;
+                    let _ = self.event_tx.send(PlaybackEvent::Paused);
+                }
+                Ok(PlaybackControl::Resume) => {
+                    self.paused = false;
+                    let _ = self.event_tx.send(PlaybackEvent::Resumed);
+                }
+                // Proceed and ErrorResponse are only meaningful inside blocking gates.
+                Ok(PlaybackControl::Proceed | PlaybackControl::ErrorResponse(_)) => {}
+                // Channel empty — done draining.
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+                // Channel closed — treat as Stop.
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(PlaybackError::Stopped);
+                }
+            }
+        }
     }
 
     /// Block at a confirmation gate until [`PlaybackControl::Proceed`] is received.
@@ -362,7 +413,16 @@ impl PlaybackEngine {
 
         loop {
             match self.control_rx.recv().await {
+                // Advance past gate. Paused state unchanged — if paused,
+                // the next step will gate again (single-step advance).
                 Some(PlaybackControl::Proceed) => return Ok(()),
+
+                // Clear pause and advance past gate.
+                Some(PlaybackControl::Resume) => {
+                    self.paused = false;
+                    let _ = self.event_tx.send(PlaybackEvent::Resumed);
+                    return Ok(());
+                }
 
                 Some(PlaybackControl::SetSpeed(speed)) => {
                     self.speed = speed;
@@ -370,11 +430,9 @@ impl PlaybackEngine {
                 }
 
                 Some(PlaybackControl::Pause) => {
-                    self.speed = PlaybackSpeed::Manual;
-                    let _ = self
-                        .event_tx
-                        .send(PlaybackEvent::SpeedChanged(PlaybackSpeed::Manual));
-                    // Still waiting for Proceed.
+                    self.paused = true;
+                    let _ = self.event_tx.send(PlaybackEvent::Paused);
+                    // Still waiting for Proceed or Resume.
                 }
 
                 // Ignore error responses while at a confirmation gate.
@@ -405,10 +463,13 @@ impl PlaybackEngine {
                 }
 
                 Some(PlaybackControl::Pause) => {
-                    self.speed = PlaybackSpeed::Manual;
-                    let _ = self
-                        .event_tx
-                        .send(PlaybackEvent::SpeedChanged(PlaybackSpeed::Manual));
+                    self.paused = true;
+                    let _ = self.event_tx.send(PlaybackEvent::Paused);
+                }
+
+                Some(PlaybackControl::Resume) => {
+                    self.paused = false;
+                    let _ = self.event_tx.send(PlaybackEvent::Resumed);
                 }
 
                 // Ignore Proceed while in error state.
@@ -501,25 +562,18 @@ mod tests {
     // ── Gate-decision pure tests ──────────────────────────────────────────
 
     #[test]
-    fn manual_gates_every_step() {
-        for step in &[click_step(), type_step(), wait_for_navigation_step()] {
-            assert!(needs_step_gate(PlaybackSpeed::Manual, step));
-        }
-    }
-
-    #[test]
-    fn cell_gates_only_type_steps() {
-        assert!(!needs_step_gate(PlaybackSpeed::Cell, &click_step()));
-        assert!(needs_step_gate(PlaybackSpeed::Cell, &type_step()));
+    fn step_speed_gates_only_type_steps() {
+        assert!(!needs_step_gate(PlaybackSpeed::Step, &click_step()));
+        assert!(needs_step_gate(PlaybackSpeed::Step, &type_step()));
         assert!(!needs_step_gate(
-            PlaybackSpeed::Cell,
+            PlaybackSpeed::Step,
             &wait_for_navigation_step()
         ));
     }
 
     #[test]
-    fn row_and_auto_never_gate_steps() {
-        for speed in [PlaybackSpeed::Row, PlaybackSpeed::Auto] {
+    fn walk_and_run_never_gate_steps() {
+        for speed in [PlaybackSpeed::Walk, PlaybackSpeed::Run] {
             for step in &[click_step(), type_step(), wait_for_navigation_step()] {
                 assert!(!needs_step_gate(speed, step));
             }
@@ -527,11 +581,10 @@ mod tests {
     }
 
     #[test]
-    fn only_row_speed_gates_rows() {
-        assert!(needs_row_gate(PlaybackSpeed::Row));
-        assert!(!needs_row_gate(PlaybackSpeed::Manual));
-        assert!(!needs_row_gate(PlaybackSpeed::Cell));
-        assert!(!needs_row_gate(PlaybackSpeed::Auto));
+    fn only_walk_speed_gates_rows() {
+        assert!(needs_row_gate(PlaybackSpeed::Walk));
+        assert!(!needs_row_gate(PlaybackSpeed::Step));
+        assert!(!needs_row_gate(PlaybackSpeed::Run));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -590,7 +643,7 @@ mod tests {
         let (mut engine, _ctrl, mut event_rx) = new_instant(
             empty_workflow(),
             dataset(&["Alice", "Bob"]),
-            PlaybackSpeed::Auto,
+            PlaybackSpeed::Run,
             0,
         );
 
@@ -626,7 +679,7 @@ mod tests {
         let (mut engine, _ctrl, mut event_rx) = new_instant(
             empty_workflow(),
             dataset(&["Alice", "Bob"]),
-            PlaybackSpeed::Auto,
+            PlaybackSpeed::Run,
             0,
         );
 
@@ -650,7 +703,7 @@ mod tests {
         let (mut engine, _ctrl, mut event_rx) = new_instant(
             empty_workflow(),
             dataset(&["Alice", "Bob"]),
-            PlaybackSpeed::Auto,
+            PlaybackSpeed::Run,
             1,
         );
 
@@ -675,7 +728,7 @@ mod tests {
         let (mut engine, _ctrl, mut event_rx) = new_instant(
             empty_workflow(),
             dataset(&["Alice", "Bob"]),
-            PlaybackSpeed::Auto,
+            PlaybackSpeed::Run,
             0,
         );
 
@@ -703,7 +756,7 @@ mod tests {
         let (mut engine, _ctrl, mut event_rx) = new_instant(
             workflow_with_steps(steps),
             dataset(&["x"]),
-            PlaybackSpeed::Auto,
+            PlaybackSpeed::Run,
             0,
         );
 
@@ -739,7 +792,7 @@ mod tests {
         let (mut engine, ctrl_tx, mut event_rx) = new_instant(
             workflow_with_steps(steps),
             dataset(&["x"]),
-            PlaybackSpeed::Row,
+            PlaybackSpeed::Walk,
             0,
         );
 
@@ -763,21 +816,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_gate_fires_after_every_step() {
+    async fn step_speed_gates_after_type_steps() {
+        // Click + Type at Step speed: only the Type step gates.
         let steps = vec![click_step(), type_step()];
         let (mut engine, ctrl_tx, _event_rx) = new_instant(
             workflow_with_steps(steps),
             dataset(&["x"]),
-            PlaybackSpeed::Manual,
+            PlaybackSpeed::Step,
             0,
         );
 
         let handle = tokio::spawn(async move { engine.run_with(OkExecutor).await });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
-        // Two steps → two gates; send Proceed for each.
-        ctrl_tx.send(PlaybackControl::Proceed).unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // One gate (after the Type step). Click auto-advances.
         ctrl_tx.send(PlaybackControl::Proceed).unwrap();
 
         let result = handle.await.unwrap();
@@ -788,7 +840,7 @@ mod tests {
     async fn set_speed_during_gate_is_applied() {
         // Row speed → gate fires after the row's steps.
         let (mut engine, ctrl_tx, mut event_rx) =
-            new_instant(empty_workflow(), dataset(&["x"]), PlaybackSpeed::Row, 0);
+            new_instant(empty_workflow(), dataset(&["x"]), PlaybackSpeed::Walk, 0);
 
         let handle = tokio::spawn(async move {
             let result = engine.run_with(OkExecutor).await;
@@ -797,26 +849,26 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         ctrl_tx
-            .send(PlaybackControl::SetSpeed(PlaybackSpeed::Auto))
+            .send(PlaybackControl::SetSpeed(PlaybackSpeed::Run))
             .unwrap();
         ctrl_tx.send(PlaybackControl::Proceed).unwrap();
 
         let (result, final_speed) = handle.await.unwrap();
         assert!(result.is_ok());
-        assert_eq!(final_speed, PlaybackSpeed::Auto);
+        assert_eq!(final_speed, PlaybackSpeed::Run);
 
         let events = drain_events(&mut event_rx);
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PlaybackEvent::SpeedChanged(PlaybackSpeed::Auto)))
+                .any(|e| matches!(e, PlaybackEvent::SpeedChanged(PlaybackSpeed::Run)))
         );
     }
 
     #[tokio::test]
     async fn channel_close_stops_engine_at_gate() {
         let (mut engine, ctrl_tx, _event_rx) =
-            new_instant(empty_workflow(), dataset(&["x"]), PlaybackSpeed::Row, 0);
+            new_instant(empty_workflow(), dataset(&["x"]), PlaybackSpeed::Walk, 0);
 
         let handle = tokio::spawn(async move { engine.run_with(OkExecutor).await });
 
@@ -827,6 +879,87 @@ mod tests {
         assert!(matches!(result, Err(PlaybackError::Stopped)));
     }
 
+    // ── Speed change in ungated mode (the primary bug fix) ──────────────
+
+    #[tokio::test]
+    async fn speed_change_at_run_takes_effect_between_steps() {
+        // Many type steps at Run speed across multiple rows. Send SetSpeed(Step)
+        // early — the engine must gate on the next Type step instead of running
+        // through all rows.
+        let steps = vec![type_step()];
+        let (mut engine, ctrl_tx, mut event_rx) = new_instant(
+            workflow_with_steps(steps),
+            dataset(&["a", "b", "c", "d", "e"]),
+            PlaybackSpeed::Run,
+            0,
+        );
+
+        // Pre-load the speed change so it's in the channel before the engine
+        // even starts. The engine must pick it up in apply_pending_controls.
+        ctrl_tx
+            .send(PlaybackControl::SetSpeed(PlaybackSpeed::Step))
+            .unwrap();
+
+        let handle = tokio::spawn(async move { engine.run_with(OkExecutor).await });
+
+        // Engine should gate after the first Type step (now at Step speed).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let events = drain_events(&mut event_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PlaybackEvent::SpeedChanged(PlaybackSpeed::Step))),
+            "engine should have applied the speed change",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PlaybackEvent::WaitingForConfirmation)),
+            "engine should have gated after switching to Step speed",
+        );
+
+        // Proceed through remaining rows.
+        for _ in 0..5 {
+            let _ = ctrl_tx.send(PlaybackControl::Proceed);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pause_at_run_gates_engine() {
+        // Many steps at Run speed. Pre-load Pause so the engine picks it up
+        // between steps and gates.
+        let steps = vec![click_step(), type_step(), click_step()];
+        let (mut engine, ctrl_tx, mut event_rx) = new_instant(
+            workflow_with_steps(steps),
+            dataset(&["a", "b", "c"]),
+            PlaybackSpeed::Run,
+            0,
+        );
+
+        // Pre-load pause.
+        ctrl_tx.send(PlaybackControl::Pause).unwrap();
+
+        let handle = tokio::spawn(async move { engine.run_with(OkExecutor).await });
+
+        // Give the engine time to hit the gate.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = drain_events(&mut event_rx);
+        assert!(
+            events.iter().any(|e| matches!(e, PlaybackEvent::Paused)),
+            "engine should have emitted Paused",
+        );
+
+        // Resume and let it finish.
+        ctrl_tx.send(PlaybackControl::Resume).unwrap();
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
     // ── Error-handling tests ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -835,7 +968,7 @@ mod tests {
         let (mut engine, ctrl_tx, mut event_rx) = new_instant(
             workflow_with_steps(steps),
             dataset(&["x", "y"]),
-            PlaybackSpeed::Auto,
+            PlaybackSpeed::Run,
             0,
         );
 
@@ -899,7 +1032,7 @@ mod tests {
         let (mut engine, ctrl_tx, _event_rx) = new_instant(
             workflow_with_steps(steps),
             dataset(&["x"]),
-            PlaybackSpeed::Auto,
+            PlaybackSpeed::Run,
             0,
         );
 
@@ -924,7 +1057,7 @@ mod tests {
         let (mut engine, ctrl_tx, _event_rx) = new_instant(
             workflow_with_steps(steps),
             dataset(&["x"]),
-            PlaybackSpeed::Auto,
+            PlaybackSpeed::Run,
             0,
         );
 
@@ -948,7 +1081,7 @@ mod tests {
         let workflow = Workflow::new(3, vec![], vec![None, None, None], BTreeMap::new(), None);
         let ds = dataset(&["x", "y"]);
 
-        let (mut engine, _ctrl, _event_rx) = new_instant(workflow, ds, PlaybackSpeed::Auto, 0);
+        let (mut engine, _ctrl, _event_rx) = new_instant(workflow, ds, PlaybackSpeed::Run, 0);
 
         let result = engine.run_with(OkExecutor).await;
         assert!(matches!(result, Err(PlaybackError::Other(_))));
@@ -998,7 +1131,7 @@ mod tests {
         )
         .expect("test dataset");
 
-        let (mut engine, _ctrl, mut event_rx) = new_instant(loaded, ds, PlaybackSpeed::Auto, 0);
+        let (mut engine, _ctrl, mut event_rx) = new_instant(loaded, ds, PlaybackSpeed::Run, 0);
 
         let result = engine.run_with(OkExecutor).await.unwrap();
         assert_eq!(result.rows_completed, 2);

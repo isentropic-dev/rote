@@ -80,18 +80,20 @@ pub enum EmptyCellRule {
 }
 
 /// Playback speed levels.
+///
+/// Controls the pacing granularity during playback. Step is the most granular
+/// (pause after each field), Walk pauses between rows, Run goes continuously.
+/// Pause (Space) can halt at any speed — there is no separate "manual" level.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PlaybackSpeed {
-    /// User manually triggers each step.
+    /// Pause after each field fill (Type step). Clicks and navigations auto-advance.
     #[default]
-    Manual,
-    /// Auto-advance within a cell, pause between cells.
-    Cell,
-    /// Auto-advance within a row, pause between rows.
-    Row,
-    /// Fully automatic playback.
-    Auto,
+    Step,
+    /// Pause at end of each row. Steps within a row auto-advance with delay.
+    Walk,
+    /// Fully automatic. No gates, minimal delay.
+    Run,
 }
 
 /// Current workflow format version.
@@ -334,14 +336,14 @@ mod tests {
 
     #[test]
     fn playback_speed_default() {
-        assert_eq!(PlaybackSpeed::default(), PlaybackSpeed::Manual);
+        assert_eq!(PlaybackSpeed::default(), PlaybackSpeed::Step);
     }
 
     #[test]
     fn playback_speed_serialization() {
-        let speed = PlaybackSpeed::Auto;
+        let speed = PlaybackSpeed::Run;
         let json = serde_json::to_string(&speed).unwrap();
-        assert_eq!(json, r#""auto""#);
+        assert_eq!(json, r#""run""#);
         let back: PlaybackSpeed = serde_json::from_str(&json).unwrap();
         assert_eq!(back, speed);
     }

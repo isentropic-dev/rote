@@ -676,14 +676,14 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut core = TrainingCore::new(ds, tx);
 
-        core.process(Command::SetSpeed(PlaybackSpeed::Auto));
+        core.process(Command::SetSpeed(PlaybackSpeed::Run));
 
         let events = drain_events(&mut rx);
         assert!(has_event(&events, |e| matches!(
             e,
-            TrainingEvent::SpeedChanged(PlaybackSpeed::Auto)
+            TrainingEvent::SpeedChanged(PlaybackSpeed::Run)
         )));
-        assert_eq!(core.speed(), PlaybackSpeed::Auto);
+        assert_eq!(core.speed(), PlaybackSpeed::Run);
     }
 
     #[test]
