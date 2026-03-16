@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// Record once, replay forever.
-/// Automate repetitive web data entry by watching a human do it once.
+/// Record once, replay the rest.
+/// Automate web form data entry by example.
 #[derive(Debug, Parser)]
 #[command(version)]
 pub struct Args {
