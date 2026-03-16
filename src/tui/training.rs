@@ -447,10 +447,12 @@ fn column_name(dataset: &DataSet, column: usize) -> String {
 /// Summarize a step for status messages.
 fn step_summary(step: &Step) -> String {
     match step {
-        Step::Click { selector } => {
+        Step::Click { selector, .. } => {
             format!("Click {}", describe_selector(selector))
         }
-        Step::Type { selector, source } => {
+        Step::Type {
+            selector, source, ..
+        } => {
             format!(
                 "Type {} into {}",
                 describe_source(source),

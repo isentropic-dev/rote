@@ -351,6 +351,18 @@ fn handle_playback_event(
         PlaybackEvent::SpeedMultiplierChanged(m) => {
             state.speed_multiplier = m;
         }
+        PlaybackEvent::FallbackUsed {
+            row_index,
+            step_index,
+            ref observed_selector,
+            ..
+        } => {
+            state.status = format!(
+                "Row {}, step {}: fallback navigation used (found: {observed_selector})",
+                row_index + 1,
+                step_index + 1,
+            );
+        }
         PlaybackEvent::RowCompleted { row_index } => {
             state.rows_completed += 1;
             table_state.set_row_state(row_index, RowState::Done);

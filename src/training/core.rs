@@ -1,13 +1,15 @@
 // Training core state machine implementation.
 
 use std::collections::{BTreeMap, HashSet};
+use std::mem;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::data::DataSet;
-use crate::data::DataSourceConfig;
-use crate::workflow::{EmptyCellRule, PlaybackSpeed, Step, ValueSource, Workflow};
+use crate::data::{DataSet, DataSourceConfig};
+use crate::workflow::{
+    EmptyCellRule, NavKey, NavigationPath, PlaybackSpeed, Selector, Step, ValueSource, Workflow,
+};
 
 use super::{Command, SelectorInfo, TrainingEvent};
 
@@ -41,6 +43,15 @@ pub struct TrainingCore {
     empty_cell_rules: BTreeMap<usize, EmptyCellRule>,
     speed: PlaybackSpeed,
     event_tx: mpsc::UnboundedSender<TrainingEvent>,
+    /// Selector of the last clicked element — starting point for tab navigation.
+    ///
+    /// `None` when no click has been recorded yet (tabs navigate from the document).
+    pending_anchor: Option<Selector>,
+    /// Tab key presses accumulated since the last click (or session start).
+    ///
+    /// Non-empty when the user has tabbed to reach the current element.
+    /// Consumed (attached to the next step and cleared) when an input or click is recorded.
+    pending_keys: Vec<NavKey>,
 }
 
 impl TrainingCore {
@@ -59,6 +70,8 @@ impl TrainingCore {
             empty_cell_rules: BTreeMap::new(),
             speed: PlaybackSpeed::default(),
             event_tx,
+            pending_anchor: None,
+            pending_keys: Vec::new(),
         }
     }
 
@@ -82,6 +95,9 @@ impl TrainingCore {
             }
             Command::BrowserNavigation { url } => {
                 self.handle_navigation(url);
+            }
+            Command::BrowserTab { shift } => {
+                self.handle_tab(shift);
             }
             Command::AdvanceRow => {
                 self.handle_advance_row();
@@ -179,13 +195,45 @@ impl TrainingCore {
 
     fn handle_click(&mut self, selector_info: SelectorInfo, tag: String) {
         let delay = self.record_step_time();
+
+        // If the user tabbed to this element, attach the navigation path.
+        let navigation = if self.pending_keys.is_empty() {
+            None
+        } else {
+            Some(NavigationPath {
+                anchor: self.pending_anchor.take(),
+                keys: mem::take(&mut self.pending_keys),
+            })
+        };
+
         let selector = selector_info.clone().into_selector(tag);
-        let step = Step::Click { selector };
+
+        // This click becomes the new navigation anchor.
+        self.pending_anchor = Some(selector.clone());
+
+        let step = Step::Click {
+            selector,
+            navigation,
+        };
         let index = self.steps.len();
         self.steps.push(step.clone());
         self.step_selectors.push(Some(selector_info));
         self.step_delays.push(delay);
         self.emit(TrainingEvent::StepRecorded { index, step });
+    }
+
+    /// Maximum number of tab keys that can accumulate before being attached to a step.
+    ///
+    /// A real user won't tab more than ~20 times to reach a field. A higher limit
+    /// guards against synthetic events without being restrictive.
+    const MAX_PENDING_KEYS: usize = 64;
+
+    fn handle_tab(&mut self, shift: bool) {
+        if self.pending_keys.len() >= Self::MAX_PENDING_KEYS {
+            return;
+        }
+        let key = if shift { NavKey::ShiftTab } else { NavKey::Tab };
+        self.pending_keys.push(key);
     }
 
     fn handle_input(&mut self, selector_info: SelectorInfo, tag: String, value: &str) {
@@ -196,20 +244,35 @@ impl TrainingCore {
         let (source, matched_column) = self.match_column(value, existing_index);
 
         let selector = selector_info.clone().into_selector(tag);
-        let step = Step::Type {
-            selector,
-            source: source.clone(),
-        };
 
         if let Some(idx) = existing_index {
-            // Update existing step (incremental typing).
+            // Incremental typing — update existing step, preserving its navigation.
+            // Discard any pending navigation state so it doesn't leak into the
+            // next step. The user is still in the same field, not navigating.
+            self.pending_anchor = None;
+            self.pending_keys.clear();
+
             // Update the timestamp so the *next* step's delay is measured from
             // the latest keystroke, but preserve step_delays[0] = zero (the
             // first step has no predecessor to measure from).
             let delay = self.record_step_time();
 
+            // Preserve the navigation path that was captured when the step was first created.
+            let existing_nav = match &self.steps[idx] {
+                Step::Type { navigation, .. } | Step::Click { navigation, .. } => {
+                    navigation.clone()
+                }
+                Step::WaitForNavigation => None,
+            };
+
             // If the old step was column-bound, unbind it first.
             self.unbind_step(idx);
+
+            let step = Step::Type {
+                selector,
+                source: source.clone(),
+                navigation: existing_nav,
+            };
 
             self.steps[idx] = step.clone();
             self.step_selectors[idx] = Some(selector_info);
@@ -227,7 +290,27 @@ impl TrainingCore {
 
             self.emit(TrainingEvent::StepUpdated { index: idx, step });
         } else {
-            // New step.
+            // New step — attach pending navigation if the user tabbed here.
+            let navigation = if self.pending_keys.is_empty() {
+                None
+            } else {
+                Some(NavigationPath {
+                    anchor: self.pending_anchor.take(),
+                    keys: mem::take(&mut self.pending_keys),
+                })
+            };
+
+            // This element becomes the anchor for subsequent tab navigation,
+            // whether or not we consumed pending keys. If the user tabs from
+            // this field to the next, this element is the right starting point.
+            self.pending_anchor = Some(selector.clone());
+
+            let step = Step::Type {
+                selector,
+                source: source.clone(),
+                navigation,
+            };
+
             let delay = self.record_step_time();
             let index = self.steps.len();
             self.steps.push(step.clone());
@@ -258,6 +341,11 @@ impl TrainingCore {
     }
 
     fn handle_navigation(&mut self, _url: String) {
+        // The previous page's elements no longer exist — any pending anchor
+        // or tab keys from that page are stale and must be discarded.
+        self.pending_anchor = None;
+        self.pending_keys.clear();
+
         let delay = self.record_step_time();
         let step = Step::WaitForNavigation;
         let index = self.steps.len();
@@ -321,18 +409,24 @@ impl TrainingCore {
             if already_bound.contains(&i) {
                 return None;
             }
-            if let Step::Type { selector, .. } = step {
-                Some((i, selector.clone()))
+            if let Step::Type {
+                selector,
+                navigation,
+                ..
+            } = step
+            {
+                Some((i, selector.clone(), navigation.clone()))
             } else {
                 None
             }
         });
 
-        if let Some((idx, selector)) = found {
-            // Update the step's source to the new column.
+        if let Some((idx, selector, existing_nav)) = found {
+            // Update the step's source to the new column, preserving its navigation path.
             let updated = Step::Type {
                 selector,
                 source: ValueSource::Column { index: column },
+                navigation: existing_nav,
             };
             self.steps[idx] = updated.clone();
 
@@ -417,7 +511,8 @@ impl TrainingCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data;
+
+    use crate::{data, workflow::Resolution};
 
     /// Create a test data set from TSV text.
     fn test_data(tsv: &str) -> DataSet {
@@ -1183,6 +1278,391 @@ mod tests {
         // Only one step: it was updated, not duplicated.
         assert_eq!(wf.steps.len(), 1);
         assert_eq!(wf.step_delays.len(), 1);
+    }
+
+    // -- Navigation capture tests --
+
+    #[test]
+    fn click_then_tabs_then_input_attaches_navigation() {
+        // Click sets anchor, tabs accumulate, input on new element gets NavigationPath.
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserClick {
+            selector_info: sel("submit-btn", "#submit-btn"),
+            tag: "BUTTON".to_owned(),
+        });
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // step 0 = Click(submit-btn), step 1 = Type(name-field)
+        assert_eq!(core.steps().len(), 2);
+        match &core.steps()[1] {
+            Step::Type { navigation, .. } => {
+                let nav = navigation.as_ref().expect("expected NavigationPath");
+                assert!(nav.anchor.is_some(), "anchor should be submit-btn");
+                assert_eq!(nav.keys, vec![NavKey::Tab, NavKey::Tab]);
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn tabs_then_input_no_prior_click_has_none_anchor() {
+        // Tabs from URL bar (no prior click) → anchor = None.
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        assert_eq!(core.steps().len(), 1);
+        match &core.steps()[0] {
+            Step::Type { navigation, .. } => {
+                let nav = navigation.as_ref().expect("expected NavigationPath");
+                assert!(nav.anchor.is_none(), "no prior click → anchor = None");
+                assert_eq!(nav.keys, vec![NavKey::Tab]);
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn direct_click_into_field_then_type_has_no_navigation() {
+        // User clicks directly into a field (no tabs) → navigation = None.
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Click on the field itself.
+        core.process(Command::BrowserClick {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+        });
+        // Input on the same element → replaces Click step (incremental-typing path).
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // The Click step is replaced by the Type step (same element).
+        assert_eq!(core.steps().len(), 1);
+        match &core.steps()[0] {
+            Step::Type { navigation, .. } => {
+                assert!(navigation.is_none(), "direct click → no navigation");
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn incremental_typing_does_not_overwrite_navigation() {
+        // Navigation captured on first input must survive subsequent keystrokes.
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserTab { shift: false });
+        // First keystroke — new step, navigation captured.
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Al".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // Second keystroke on the same element — incremental update.
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        assert_eq!(core.steps().len(), 1);
+        match &core.steps()[0] {
+            Step::Type { navigation, .. } => {
+                let nav = navigation.as_ref().expect("navigation should be preserved");
+                assert!(nav.anchor.is_none());
+                assert_eq!(nav.keys, vec![NavKey::Tab]);
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn tabs_then_click_attaches_navigation_to_click_step() {
+        // User tabs to a button and clicks it → Click step has NavigationPath.
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserTab { shift: true });
+        core.process(Command::BrowserClick {
+            selector_info: sel("submit-btn", "#submit-btn"),
+            tag: "BUTTON".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        assert_eq!(core.steps().len(), 1);
+        match &core.steps()[0] {
+            Step::Click { navigation, .. } => {
+                let nav = navigation
+                    .as_ref()
+                    .expect("expected NavigationPath on Click");
+                assert!(nav.anchor.is_none(), "no prior click → anchor = None");
+                assert_eq!(nav.keys, vec![NavKey::Tab, NavKey::ShiftTab]);
+            }
+            _ => panic!("expected Click step"),
+        }
+    }
+
+    #[test]
+    fn tabs_with_no_subsequent_interaction_are_discarded() {
+        // User tabs around, then clicks a new element → tabs are consumed by the click.
+        // Pending state resets cleanly and subsequent inputs have no stale keys.
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Tab around (these tabs end up on the click step, not on a later input).
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserTab { shift: false });
+
+        // Click — consumes the tabs as its own NavigationPath.
+        core.process(Command::BrowserClick {
+            selector_info: sel("some-btn", "#some-btn"),
+            tag: "BUTTON".to_owned(),
+        });
+
+        // No more tabs — direct input into a field.
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // step 0 = Click (with the two tabs), step 1 = Type (no navigation).
+        assert_eq!(core.steps().len(), 2);
+        match &core.steps()[1] {
+            Step::Type { navigation, .. } => {
+                assert!(
+                    navigation.is_none(),
+                    "tabs were consumed by the click; Type step has no navigation"
+                );
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn tab_then_click_then_type_preserves_navigation_on_same_element() {
+        // User tabs to an input field, browser fires click, then user types.
+        // The Click step has the navigation. When replaced by Type (same element),
+        // the navigation must be preserved.
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Tab to the field.
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserTab { shift: false });
+
+        // Click on the field (browser fires click on focus).
+        core.process(Command::BrowserClick {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+        });
+
+        // Type into the same field — replaces Click with Type.
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // Should be one step (Type replaced Click for same element).
+        assert_eq!(core.steps().len(), 1);
+        match &core.steps()[0] {
+            Step::Type { navigation, .. } => {
+                let nav = navigation
+                    .as_ref()
+                    .expect("navigation from Click should be preserved on Type");
+                assert!(nav.anchor.is_none(), "no prior click → anchor = None");
+                assert_eq!(nav.keys, vec![NavKey::Tab, NavKey::Tab]);
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn multi_field_tab_chain_uses_previous_field_as_anchor() {
+        // click → tab → type A → tab → type B
+        // Field B's anchor should be field A, not None.
+        let ds = test_data("name\tage\nAlice\t30\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Click a landmark.
+        core.process(Command::BrowserClick {
+            selector_info: sel("landmark", "#landmark"),
+            tag: "BUTTON".to_owned(),
+        });
+
+        // Tab to field A, type.
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+
+        // Tab to field B, type.
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserInput {
+            selector_info: sel("age-field", "#age-field"),
+            tag: "INPUT".to_owned(),
+            value: "30".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // step 0 = Click(landmark), step 1 = Type(name), step 2 = Type(age)
+        assert_eq!(core.steps().len(), 3);
+
+        // Field A's anchor should be the landmark.
+        match &core.steps()[1] {
+            Step::Type { navigation, .. } => {
+                let nav = navigation.as_ref().expect("field A should have navigation");
+                assert!(nav.anchor.is_some(), "anchor should be the landmark");
+                assert_eq!(nav.keys, vec![NavKey::Tab]);
+            }
+            _ => panic!("expected Type step"),
+        }
+
+        // Field B's anchor should be field A (name-field), not None.
+        match &core.steps()[2] {
+            Step::Type { navigation, .. } => {
+                let nav = navigation.as_ref().expect("field B should have navigation");
+                let anchor = nav.anchor.as_ref().expect("anchor should be field A");
+                assert!(
+                    anchor
+                        .strategies
+                        .iter()
+                        .any(|r| matches!(r, Resolution::Id { id } if id == "name-field")),
+                    "anchor should reference name-field",
+                );
+                assert_eq!(nav.keys, vec![NavKey::Tab]);
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn incremental_typing_clears_pending_navigation() {
+        // Tabs accumulated before re-entering an existing field must not leak
+        // into the next new step.
+        let ds = test_data("name\tage\nAlice\t30\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Type in field A (new step).
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+
+        // Tab, then re-type into field A (incremental typing — same element).
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserInput {
+            selector_info: sel("name-field", "#name-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice!".to_owned(),
+        });
+
+        // Now type into field B (new step) — should NOT have the stale tab.
+        core.process(Command::BrowserInput {
+            selector_info: sel("age-field", "#age-field"),
+            tag: "INPUT".to_owned(),
+            value: "30".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        assert_eq!(core.steps().len(), 2);
+        match &core.steps()[1] {
+            Step::Type { navigation, .. } => {
+                assert!(
+                    navigation.is_none(),
+                    "stale tab should not leak to new step",
+                );
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn page_navigation_clears_pending_state() {
+        // Tabs and clicks from the previous page must not survive a navigation.
+        let ds = test_data("name\nAlice\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = TrainingCore::new(ds, tx);
+
+        // Click and tab on page 1.
+        core.process(Command::BrowserClick {
+            selector_info: sel("old-btn", "#old-btn"),
+            tag: "BUTTON".to_owned(),
+        });
+        core.process(Command::BrowserTab { shift: false });
+
+        // Navigate to a new page.
+        core.process(Command::BrowserNavigation {
+            url: "https://example.com/page2".to_owned(),
+        });
+
+        // Tab and type on the new page.
+        core.process(Command::BrowserTab { shift: false });
+        core.process(Command::BrowserInput {
+            selector_info: sel("new-field", "#new-field"),
+            tag: "INPUT".to_owned(),
+            value: "Alice".to_owned(),
+        });
+        let _ = drain_events(&mut rx);
+
+        // Find the Type step (after Click and WaitForNavigation steps).
+        let type_step = core
+            .steps()
+            .iter()
+            .find(|s| matches!(s, Step::Type { .. }))
+            .expect("should have a Type step");
+
+        match type_step {
+            Step::Type { navigation, .. } => {
+                let nav = navigation.as_ref().expect("should have navigation");
+                // Anchor should be None (old-btn was on a different page and
+                // was cleared by navigation). Only the post-navigation tab counts.
+                assert!(nav.anchor.is_none(), "old page anchor should be cleared");
+                assert_eq!(nav.keys, vec![NavKey::Tab]);
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

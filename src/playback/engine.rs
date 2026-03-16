@@ -550,6 +550,7 @@ mod tests {
                 strategies: vec![],
                 tag: "BUTTON".to_owned(),
             },
+            navigation: None,
         }
     }
 
@@ -562,6 +563,7 @@ mod tests {
             source: ValueSource::Literal {
                 value: "x".to_owned(),
             },
+            navigation: None,
         }
     }
 
@@ -1174,6 +1176,7 @@ mod tests {
                         }],
                         tag: "BUTTON".to_owned(),
                     },
+                    navigation: None,
                 },
                 Step::Type {
                     selector: Selector {
@@ -1181,6 +1184,7 @@ mod tests {
                         tag: "INPUT".to_owned(),
                     },
                     source: ValueSource::Column { index: 0 },
+                    navigation: None,
                 },
             ],
             vec![Duration::ZERO, Duration::ZERO],

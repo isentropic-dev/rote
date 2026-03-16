@@ -121,6 +121,26 @@ pub enum PlaybackEvent {
     SpeedMultiplierChanged(f64),
     /// Engine is at a confirmation gate (speed-based), waiting for [`PlaybackControl::Proceed`].
     WaitingForConfirmation,
+    /// A step used navigation fallback instead of DOM selectors.
+    ///
+    /// Emitted when exact selectors fail and the engine falls back to tab
+    /// navigation. The TUI should surface this to the user — typically by
+    /// forcing step mode so they can verify the right field was targeted.
+    FallbackUsed {
+        /// Zero-based row index.
+        row_index: usize,
+        /// Zero-based step index within the workflow.
+        step_index: usize,
+        /// The selectors that were tried and failed.
+        failed_selectors: String,
+        /// The selector observed on the element reached via navigation.
+        /// Captured for diagnostic logging — helps discover ID patterns.
+        ///
+        /// **Note:** this value comes from live DOM content on an arbitrary
+        /// website. When displaying in a terminal, sanitize for escape
+        /// sequences (element IDs or class names could contain them).
+        observed_selector: String,
+    },
     /// A step failed.
     StepFailed {
         /// Zero-based row index.

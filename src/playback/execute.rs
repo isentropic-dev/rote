@@ -72,7 +72,7 @@ async fn execute_click(
     step: &Step,
     config: &PlaybackConfig,
 ) -> Result<(), PlaybackError> {
-    let Step::Click { selector } = step else {
+    let Step::Click { selector, .. } = step else {
         // Unreachable: caller dispatches by step variant.
         return Err(PlaybackError::Other(
             "execute_click called with non-Click step".to_owned(),
@@ -96,7 +96,10 @@ async fn execute_type(
     rules: &BTreeMap<usize, EmptyCellRule>,
     config: &PlaybackConfig,
 ) -> Result<StepOutcome, PlaybackError> {
-    let Step::Type { selector, source } = step else {
+    let Step::Type {
+        selector, source, ..
+    } = step
+    else {
         // Unreachable: caller dispatches by step variant.
         return Err(PlaybackError::Other(
             "execute_type called with non-Type step".to_owned(),

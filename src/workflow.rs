@@ -63,6 +63,39 @@ pub enum Resolution {
     TextContent { text: String },
 }
 
+/// A keyboard key used during navigation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum NavKey {
+    /// Tab key — move focus forward.
+    Tab,
+    /// Shift+Tab — move focus backward.
+    ShiftTab,
+}
+
+/// A recorded path to reach an element via keyboard navigation.
+///
+/// Captured during training by observing the user's clicks and tab presses
+/// before each input. During playback, this serves as a fallback when DOM
+/// selectors fail: click the anchor element (if any), then replay the key
+/// sequence to land on the target field by DOM order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationPath {
+    /// A known starting point — the last element clicked before tabbing.
+    ///
+    /// `None` means navigation starts from the document itself (e.g. the
+    /// user tabbed into the page from the URL bar). The engine focuses
+    /// `document.body` before replaying the key sequence.
+    ///
+    /// When `Some`, the anchor must be resolvable via its own selectors.
+    /// If the anchor can't be found, navigation fallback fails entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Selector>,
+    /// Key presses from the anchor (or document) to the target element.
+    pub keys: Vec<NavKey>,
+}
+
 /// Multi-strategy selector for a DOM element.
 ///
 /// Contains one or more resolution strategies. During playback, strategies
@@ -90,11 +123,19 @@ pub enum ValueSource {
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum Step {
     /// Click on an element.
-    Click { selector: Selector },
+    Click {
+        selector: Selector,
+        /// Tab navigation path, used as a fallback when DOM selectors fail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        navigation: Option<NavigationPath>,
+    },
     /// Type a value into an element.
     Type {
         selector: Selector,
         source: ValueSource,
+        /// Tab navigation path, used as a fallback when DOM selectors fail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        navigation: Option<NavigationPath>,
     },
     /// Wait for a browser navigation to complete.
     ///
@@ -135,7 +176,11 @@ pub enum PlaybackSpeed {
 }
 
 /// Current workflow format version.
-const FORMAT_VERSION: u32 = 2;
+///
+/// Version history:
+/// - v2: initial stable format (steps, delays, bindings, empty-cell rules).
+/// - v3: added optional `navigation` field on Click and Type steps.
+const FORMAT_VERSION: u32 = 3;
 
 /// A complete workflow: the artifact that bridges sessions.
 ///
@@ -206,6 +251,16 @@ pub enum WorkflowError {
 
     #[error("delay value {millis}ms exceeds maximum ({max}ms)")]
     DelayTooLarge { millis: u64, max: u64 },
+
+    #[error("step {step_index} has a navigation path with no keys")]
+    EmptyNavigationKeys { step_index: usize },
+
+    #[error("step {step_index} has a navigation path with {count} keys (max {max})")]
+    NavigationKeysTooLong {
+        step_index: usize,
+        count: usize,
+        max: usize,
+    },
 
     #[error("column {column} is bound to step {step_index}, which is not a Type step")]
     BindingNotTypeStep { column: usize, step_index: usize },
@@ -353,6 +408,31 @@ impl Workflow {
             }
         }
 
+        // Validate navigation paths on steps.
+        // A real user won't tab more than ~20 times; 64 guards against
+        // crafted files without being restrictive.
+        let max_nav_keys = 64;
+        for (i, step) in self.steps.iter().enumerate() {
+            let nav = match step {
+                Step::Click { navigation, .. } | Step::Type { navigation, .. } => {
+                    navigation.as_ref()
+                }
+                Step::WaitForNavigation => None,
+            };
+            if let Some(path) = nav {
+                if path.keys.is_empty() {
+                    return Err(WorkflowError::EmptyNavigationKeys { step_index: i });
+                }
+                if path.keys.len() > max_nav_keys {
+                    return Err(WorkflowError::NavigationKeysTooLong {
+                        step_index: i,
+                        count: path.keys.len(),
+                        max: max_nav_keys,
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -381,6 +461,7 @@ mod tests {
                 }],
                 tag: "BUTTON".to_owned(),
             },
+            navigation: None,
         };
         let json = serde_json::to_string_pretty(&step).unwrap();
         let back: Step = serde_json::from_str(&json).unwrap();
@@ -395,6 +476,7 @@ mod tests {
                 tag: "INPUT".to_owned(),
             },
             source: ValueSource::Column { index: 2 },
+            navigation: None,
         };
         let json = serde_json::to_string(&step).unwrap();
         assert!(json.contains(r#""action":"type""#));
@@ -456,6 +538,7 @@ mod tests {
                         }],
                         tag: "INPUT".to_owned(),
                     },
+                    navigation: None,
                 },
                 Step::Type {
                     selector: Selector {
@@ -470,6 +553,7 @@ mod tests {
                         tag: "INPUT".to_owned(),
                     },
                     source: ValueSource::Column { index: 0 },
+                    navigation: None,
                 },
                 Step::Type {
                     selector: Selector {
@@ -479,6 +563,7 @@ mod tests {
                         tag: "INPUT".to_owned(),
                     },
                     source: ValueSource::Column { index: 1 },
+                    navigation: None,
                 },
                 Step::Click {
                     selector: Selector {
@@ -487,6 +572,7 @@ mod tests {
                         }],
                         tag: "BUTTON".to_owned(),
                     },
+                    navigation: None,
                 },
             ],
             vec![
@@ -519,7 +605,7 @@ mod tests {
     fn workflow_has_version() {
         let workflow = sample_workflow();
         let json = workflow.to_json().unwrap();
-        assert!(json.contains(r#""version": 2"#));
+        assert!(json.contains(r#""version": 3"#));
     }
 
     #[test]
@@ -550,7 +636,7 @@ mod tests {
     #[test]
     fn workflow_invalid_binding() {
         let workflow = Workflow {
-            version: 2,
+            version: 3,
             column_count: 1,
             steps: vec![],
             step_delays: vec![],
@@ -569,7 +655,7 @@ mod tests {
         let mut rules = BTreeMap::new();
         rules.insert(10, EmptyCellRule::Clear);
         let workflow = Workflow {
-            version: 2,
+            version: 3,
             column_count: 2,
             steps: vec![],
             step_delays: vec![],
@@ -619,7 +705,7 @@ mod tests {
     #[test]
     fn workflow_column_binding_length_mismatch() {
         let workflow = Workflow {
-            version: 2,
+            version: 3,
             column_count: 3,
             steps: vec![],
             step_delays: vec![],
@@ -643,9 +729,10 @@ mod tests {
                 strategies: vec![],
                 tag: "BUTTON".to_owned(),
             },
+            navigation: None,
         };
         let workflow = Workflow {
-            version: 2,
+            version: 3,
             column_count: 1,
             steps: vec![click],
             step_delays: vec![Duration::ZERO],
@@ -665,7 +752,7 @@ mod tests {
     #[test]
     fn workflow_delay_length_mismatch() {
         let workflow = Workflow {
-            version: 2,
+            version: 3,
             column_count: 0,
             steps: vec![Step::WaitForNavigation],
             step_delays: vec![], // length 0, but steps has 1
@@ -692,5 +779,195 @@ mod tests {
         let back = Workflow::from_json(&json).unwrap();
         assert_eq!(back.step_delays, workflow.step_delays);
         assert_eq!(back.row_end_delay, workflow.row_end_delay);
+    }
+
+    // ── Navigation path tests ─────────────────────────────────────────
+
+    #[test]
+    fn nav_key_serialization() {
+        let tab = NavKey::Tab;
+        let json = serde_json::to_string(&tab).unwrap();
+        assert_eq!(json, r#""tab""#);
+
+        let shift_tab = NavKey::ShiftTab;
+        let json = serde_json::to_string(&shift_tab).unwrap();
+        assert_eq!(json, r#""shiftTab""#);
+
+        let back: NavKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, NavKey::ShiftTab);
+    }
+
+    #[test]
+    fn navigation_path_with_anchor_serialization() {
+        let path = NavigationPath {
+            anchor: Some(Selector {
+                strategies: vec![Resolution::Id {
+                    id: "submit-btn".to_owned(),
+                }],
+                tag: "BUTTON".to_owned(),
+            }),
+            keys: vec![NavKey::Tab, NavKey::Tab, NavKey::Tab],
+        };
+        let json = serde_json::to_string_pretty(&path).unwrap();
+        assert!(json.contains("anchor"));
+        assert!(json.contains("keys"));
+        let back: NavigationPath = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, path);
+    }
+
+    #[test]
+    fn navigation_path_without_anchor_serialization() {
+        let path = NavigationPath {
+            anchor: None,
+            keys: vec![NavKey::Tab, NavKey::Tab],
+        };
+        let json = serde_json::to_string_pretty(&path).unwrap();
+        assert!(!json.contains("anchor"));
+        assert!(json.contains("keys"));
+        let back: NavigationPath = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, path);
+    }
+
+    #[test]
+    fn step_with_navigation_serialization() {
+        let step = Step::Type {
+            selector: Selector {
+                strategies: vec![Resolution::Id {
+                    id: "name-field".to_owned(),
+                }],
+                tag: "INPUT".to_owned(),
+            },
+            source: ValueSource::Column { index: 0 },
+            navigation: Some(NavigationPath {
+                anchor: Some(Selector {
+                    strategies: vec![Resolution::TextContent {
+                        text: "Submit".to_owned(),
+                    }],
+                    tag: "BUTTON".to_owned(),
+                }),
+                keys: vec![NavKey::ShiftTab, NavKey::ShiftTab],
+            }),
+        };
+        let json = serde_json::to_string_pretty(&step).unwrap();
+        assert!(json.contains("navigation"));
+        assert!(json.contains("shiftTab"));
+        let back: Step = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, step);
+    }
+
+    #[test]
+    fn step_without_navigation_omits_field() {
+        let step = Step::Click {
+            selector: Selector {
+                strategies: vec![],
+                tag: "BUTTON".to_owned(),
+            },
+            navigation: None,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(!json.contains("navigation"));
+    }
+
+    #[test]
+    fn v2_workflow_deserializes_with_no_navigation() {
+        // A v2 workflow JSON has no navigation fields on steps.
+        // It should deserialize cleanly with navigation = None.
+        let json = r#"{
+            "version": 2,
+            "columnCount": 1,
+            "steps": [
+                {
+                    "action": "click",
+                    "selector": {
+                        "strategies": [{"type": "id", "id": "btn"}],
+                        "tag": "BUTTON"
+                    }
+                },
+                {
+                    "action": "type",
+                    "selector": {
+                        "strategies": [],
+                        "tag": "INPUT"
+                    },
+                    "source": {"type": "column", "index": 0}
+                }
+            ],
+            "stepDelays": [0, 0],
+            "rowEndDelay": 0,
+            "columnBindings": [1]
+        }"#;
+        let workflow = Workflow::from_json(json).unwrap();
+        assert_eq!(workflow.steps.len(), 2);
+
+        // Navigation should default to None on both steps.
+        match &workflow.steps[0] {
+            Step::Click { navigation, .. } => assert!(navigation.is_none()),
+            _ => panic!("expected Click"),
+        }
+        match &workflow.steps[1] {
+            Step::Type { navigation, .. } => assert!(navigation.is_none()),
+            _ => panic!("expected Type"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_navigation_keys() {
+        let workflow = Workflow {
+            version: 3,
+            column_count: 0,
+            steps: vec![Step::Click {
+                selector: Selector {
+                    strategies: vec![],
+                    tag: "BUTTON".to_owned(),
+                },
+                navigation: Some(NavigationPath {
+                    anchor: None,
+                    keys: vec![],
+                }),
+            }],
+            step_delays: vec![Duration::ZERO],
+            row_end_delay: Duration::ZERO,
+            column_bindings: vec![],
+            empty_cell_rules: BTreeMap::new(),
+            data_source: None,
+        };
+        let json = serde_json::to_string(&workflow).unwrap();
+        let err = Workflow::from_json(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("no keys"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_too_many_navigation_keys() {
+        let workflow = Workflow {
+            version: 3,
+            column_count: 0,
+            steps: vec![Step::Type {
+                selector: Selector {
+                    strategies: vec![],
+                    tag: "INPUT".to_owned(),
+                },
+                source: ValueSource::Literal {
+                    value: "x".to_owned(),
+                },
+                navigation: Some(NavigationPath {
+                    anchor: None,
+                    keys: vec![NavKey::Tab; 100],
+                }),
+            }],
+            step_delays: vec![Duration::ZERO],
+            row_end_delay: Duration::ZERO,
+            column_bindings: vec![],
+            empty_cell_rules: BTreeMap::new(),
+            data_source: None,
+        };
+        let json = serde_json::to_string(&workflow).unwrap();
+        let err = Workflow::from_json(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("100 keys"),
+            "unexpected error: {err}",
+        );
     }
 }

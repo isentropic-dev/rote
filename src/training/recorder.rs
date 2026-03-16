@@ -115,6 +115,16 @@ pub const RECORDER_SCRIPT: &str = r##"
       selector: getSelectors(el)
     }));
   }, true);
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Tab") {
+      console.log(JSON.stringify({
+        __rote: true,
+        type: "tab",
+        shiftKey: e.shiftKey
+      }));
+    }
+  }, true);
 })();
 "##;
 
@@ -153,6 +163,16 @@ pub fn parse_recorder_event(params: &Value) -> Option<Command> {
     }
 
     let event_type = obj.get("type")?.as_str()?;
+
+    // Tab events have no tagName or selector — handle them before that extraction.
+    if event_type == "tab" {
+        let shift = obj
+            .get("shiftKey")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return Some(Command::BrowserTab { shift });
+    }
+
     let tag_name = obj.get("tagName")?.as_str()?.to_owned();
 
     let selector_obj = obj.get("selector")?;
@@ -279,6 +299,28 @@ mod tests {
         assert!(params.get("source").is_some());
         let source = params["source"].as_str().unwrap();
         assert!(source.contains("__roteRecorder"));
+    }
+
+    #[test]
+    fn parse_tab_event() {
+        let json = r#"{"__rote":true,"type":"tab","shiftKey":false}"#;
+        let params = console_event(json);
+        let cmd = parse_recorder_event(&params).unwrap();
+        match cmd {
+            Command::BrowserTab { shift } => assert!(!shift),
+            _ => panic!("expected BrowserTab"),
+        }
+    }
+
+    #[test]
+    fn parse_shift_tab_event() {
+        let json = r#"{"__rote":true,"type":"tab","shiftKey":true}"#;
+        let params = console_event(json);
+        let cmd = parse_recorder_event(&params).unwrap();
+        match cmd {
+            Command::BrowserTab { shift } => assert!(shift),
+            _ => panic!("expected BrowserTab"),
+        }
     }
 
     #[test]

@@ -94,6 +94,8 @@ pub enum Command {
     },
     /// Browser navigated to a new URL.
     BrowserNavigation { url: String },
+    /// User pressed Tab or Shift+Tab to move focus.
+    BrowserTab { shift: bool },
 
     // User commands from the TUI.
     /// Advance to the next data row.

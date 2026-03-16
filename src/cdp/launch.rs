@@ -116,8 +116,9 @@ impl Drop for BrowserProcess {
 ///
 /// Creates the directory if it doesn't exist.
 fn create_profile_dir() -> Result<PathBuf, CdpError> {
-    let data_dir = dirs::data_dir()
-        .ok_or_else(|| CdpError::BrowserLaunch("could not determine platform data directory".into()))?;
+    let data_dir = dirs::data_dir().ok_or_else(|| {
+        CdpError::BrowserLaunch("could not determine platform data directory".into())
+    })?;
     let dir = data_dir.join("rote").join("profiles").join("default");
     fs::create_dir_all(&dir).map_err(|e| {
         CdpError::BrowserLaunch(format!(
