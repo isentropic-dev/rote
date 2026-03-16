@@ -1,18 +1,25 @@
 # rote
 
-Record once, replay forever.
+You have rows of data in a spreadsheet and a web form that needs each one entered by hand.
 
-Run `rote`, show it how to fill out a web form once, and it replays the pattern for every remaining row.
+Often it seems like the easiest thing to do is just... do it.
+Copy a value, switch to the browser, paste, tab to the next field, switch back, copy, switch, paste.
+For hundreds of rows, that's hours of tedious, error-prone work.
+
+You could write a script, but now you're inspecting the page, writing selectors, debugging, and rewriting it when the site changes.
+You could buy an enterprise automation platform, but that's a lot of machinery for what should be a simple task.
+
+`rote` takes a different approach: show it how to fill out the form once and let it handle the rest.
 
 No scripting. No configuration. No browser extensions. Just rote memorization.
 
 ## How it works
 
 1. Run `rote` with your data (see [Usage](#usage) for options).
-2. Navigate to the website containing your form in the browser `rote` opens.
-3. Fill out the form once.
-   `rote` watches, captures your actions, and maps columns to input fields.
-4. When the first row is done, `rote` replays the pattern for every remaining row.
+2. Navigate to the form in the browser `rote` opens.
+3. Fill it out once for the first row.
+   `rote` watches, captures your actions, and maps columns to fields.
+4. When that row is done, `rote` replays the pattern for the rest.
 
 You control the pace of playback.
 Start with one field at a time, move to one row at a time, then let it run on its own.
@@ -35,29 +42,34 @@ Requires [Rust](https://rustup.rs/) and Chrome or Edge.
 ## Usage
 
 ```
-rote --clipboard       # reads data from clipboard
-rote --data file.tsv   # reads data from a file
+rote --clipboard                 # reads data from clipboard
+rote --data file.tsv             # reads data from a file
+rote --data file.tsv --url …    # also navigates to URL to start training
 ```
 
-`rote` launches a TUI and opens a browser. Follow the prompts.
+Either `--clipboard` or `--data` is required.
+`--url` is optional and can be combined with either.
 
-### Playback speeds
+`rote` launches a TUI and opens a browser.
+It's designed to guide you through each step — training, then playback.
 
-Switch speeds at any time during a session:
+### Playback modes
 
-| Key | Speed      | Behavior                                      |
-|-----|------------|-----------------------------------------------|
-| `1` | **Manual** | You do everything. `rote` watches and learns. |
-| `2` | **Cell**   | `rote` fills one field, then waits.           |
-| `3` | **Row**    | `rote` fills one row, then waits.             |
-| `4` | **Auto**   | `rote` runs all remaining rows without stopping. |
+Switch modes at any time during playback:
 
-`Space` toggles between Manual and Auto.
-`Enter` advances past confirmation gates.
+| Key | Mode     | Behavior                                  |
+|-----|----------|-------------------------------------------|
+| `1` | **Step** | Fill one field, then wait.                |
+| `2` | **Walk** | Fill one row, then wait.                  |
+| `3` | **Run**  | Fill all remaining rows without stopping. |
+
+`Enter` advances to the next step or row.
+`+`/`-` adjust speed multiplier (0.25×–4.0×).
 
 ### Error handling
 
-When a step fails, `rote` pauses and asks what to do: skip the row, retry it, or stop.
+When a step fails, `rote` pauses and asks what to do:
+`s` to skip the row, `r` to retry it, or `q` to stop.
 
 ## Requirements
 
